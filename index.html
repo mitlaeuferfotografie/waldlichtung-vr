@@ -13,6 +13,12 @@
 		font-size: 13px; line-height: 1.45; pointer-events: none; white-space: pre;
 	}
 	#info b { color: #ffd479; }
+	#hint {
+		position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 9;
+		color: #fff; background: rgba(0,0,0,.5); padding: 14px 22px; border-radius: 10px;
+		font-size: 18px; text-align: center; pointer-events: none; line-height: 1.6;
+	}
+	#hint small { font-size: 13px; opacity: .85; }
 	#errlog {
 		position: fixed; left: 12px; bottom: 70px; right: 12px; z-index: 11; display: none;
 		color: #fff; background: rgba(160,20,20,.85); padding: 8px 12px; border-radius: 8px;
@@ -38,6 +44,7 @@
 <div id="info">Lade …</div>
 <div id="error"></div>
 <div id="errlog"></div>
+<div id="hint">Ins Bild klicken, um loszulaufen<br><small>W A S D laufen · Maus umsehen · Shift rennen · Leertaste springen · Esc Menü</small></div>
 <script>
 	// Fehler sichtbar auf der Seite anzeigen (hilfreich auf der VR-Brille, dort gibt es keine Konsole)
 	( function () {
@@ -48,8 +55,7 @@
 			seen.add( msg );
 			const box = document.getElementById( 'errlog' );
 			box.style.display = 'block';
-			box.textContent += ( box.textContent ? '
-' : '' ) + '⚠ ' + msg;
+			box.textContent += ( box.textContent ? '\n' : '' ) + '⚠ ' + msg;
 		}
 		window.addEventListener( 'error', e => show( e.message || e.error ) );
 		window.addEventListener( 'unhandledrejection', e => show( e.reason && ( e.reason.message || e.reason ) ) );
@@ -64,7 +70,6 @@ import {
 	positionLocal, positionWorld, normalWorld, cameraPosition, mx_noise_float, mx_fractal_noise_float,
 	pass, mrt, output, velocity, renderOutput, texture, screenUV
 } from 'three/tsl';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -151,15 +156,13 @@ scene.fog = new THREE.FogExp2( 0xa9c4d6, 0.005 );
 const rig = new THREE.Group(); // in VR: Position des Spielers
 scene.add( rig );
 const camera = new THREE.PerspectiveCamera( 65, window.innerWidth / window.innerHeight, 0.1, 600 );
-camera.position.set( 0, 2.6, 11 );
+camera.position.set( 0, 1.7, 11 );
 rig.add( camera );
 
-let controls = new OrbitControls( camera, renderer.domElement );
-controls.target.set( 0, 1.2, 0 );
-controls.enableDamping = true;
-controls.maxPolarAngle = Math.PI * 0.53;
-controls.minDistance = 1.5;
-controls.maxDistance = 60;
+camera.rotation.order = 'YXZ'; // erst Blick links/rechts (Yaw), dann hoch/runter (Pitch)
+
+// Hindernisse für die Kollision: Kreise (Felsen) und Kapseln (Baumstamm am Boden)
+const obstacles = [];
 
 // ---------------------------------------------------------------------------
 // Uniforms, die mehrere Shader teilen
@@ -452,6 +455,8 @@ for ( let tries = 0; treeSpots.length < ( LOW ? 340 : 520 ) && tries < 20000; tr
 {
 	const log = new THREE.CylinderGeometry( 0.35, 0.42, 7, 12 );
 	log.rotateZ( Math.PI / 2 ).rotateY( 0.5 ).translate( - 3.5, terrainHeight( - 3.5, - 3 ) + 0.3, - 3 );
+	const lx = Math.cos( 0.5 ) * 3.5, lz = - Math.sin( 0.5 ) * 3.5;
+	obstacles.push( { ax: - 3.5 - lx, az: - 3 - lz, bx: - 3.5 + lx, bz: - 3 + lz, r: 0.75 } );
 	trunks.push( tagTree( log, new THREE.Vector3( 0, 50, 0 ), 1, 0 ) ); // aTree.y hoch -> kein Schwanken
 }
 
@@ -526,6 +531,7 @@ for ( const [ list, mat ] of [ [ trunks, barkMat ], [ needles, needleMat ], [ le
 		m.rotation.y = rand() * 6;
 		m.castShadow = m.receiveShadow = true;
 		scene.add( m );
+		obstacles.push( { ax: x, az: z, bx: x, bz: z, r: s * 1.3 + 0.3 } );
 	}
 }
 
@@ -680,20 +686,31 @@ const vrButton = VRButton.createButton( renderer, renderer.backend.isWebGPUBacke
 document.body.appendChild( vrButton );
 
 let savedClouds = 0;
+let inVR = false;
 function onSessionStart() {
-	rig.position.set( 0, 0, 6 );
-	rig.rotation.set( 0, 0, 0 );
+	inVR = true;
+	lastVRHead.set( player.pos.x, 0, player.pos.z ); lastVRYaw = player.yaw;
+	// VR beginnt dort, wo die Spielfigur gerade steht, mit derselben Blickrichtung
+	rig.position.set( player.pos.x, terrainHeight( player.pos.x, player.pos.z ), player.pos.z );
+	rig.rotation.set( 0, player.yaw, 0 );
+	if ( document.pointerLockElement ) document.exitPointerLock();
 	savedClouds = sky.cloudCoverage.value;
 	if ( LOW ) sky.cloudCoverage.value = 0; // Wolken-Shader kostet pro Pixel viel
 	renderer.xr.setFoveation( 1 ); // Ränder des Blickfelds gröber rendern (Quest)
 	updateInfo();
 }
 function onSessionEnd() {
+	if ( ! inVR ) return; // nur einmal pro Sitzung
+	inVR = false;
 	sky.cloudCoverage.value = savedClouds;
+	// Spielfigur übernimmt die letzte VR-Position
+	const head = lastVRHead;
+	player.pos.set( head.x, 0, head.z );
+	player.y = terrainHeight( head.x, head.z );
+	player.yaw = lastVRYaw;
 	rig.position.set( 0, 0, 0 );
 	rig.rotation.set( 0, 0, 0 );
-	camera.position.set( 0, 2.6, 11 );
-	controls.update();
+	applyPlayerCamera( 0 );
 	updateInfo();
 }
 renderer.xr.addEventListener( 'sessionstart', onSessionStart );
@@ -720,6 +737,7 @@ const WALK_SPEED = 2.2;          // m/s in VR
 const UP = new THREE.Vector3( 0, 1, 0 );
 const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _head = new THREE.Vector3();
 let snapReady = true;
+const lastVRHead = new THREE.Vector3( 0, 0, 11 ); let lastVRYaw = 0; // für die Rückkehr aus VR
 
 function stickOf( src ) {
 	const a = src.gamepad ? src.gamepad.axes : [];
@@ -727,20 +745,28 @@ function stickOf( src ) {
 }
 const dead = v => Math.abs( v ) < 0.15 ? 0 : v;
 
-// verhindert, dass man durch Baumstämme läuft
+// verhindert, dass man durch Bäume, Felsen und den liegenden Stamm läuft
+function pushOut( pos, cx, cz, rad ) {
+	const dx = pos.x - cx, dz = pos.z - cz, d2 = dx * dx + dz * dz;
+	if ( d2 < rad * rad && d2 > 1e-8 ) {
+		const d = Math.sqrt( d2 ), k = ( rad - d ) / d;
+		pos.x += dx * k; pos.z += dz * k;
+	}
+}
 function pushOutOfTrees( pos ) {
-	for ( const t of treeSpots ) {
-		const dx = pos.x - t.x, dz = pos.z - t.z, d2 = dx * dx + dz * dz;
-		if ( d2 < 0.49 && d2 > 1e-6 ) {
-			const d = Math.sqrt( d2 ), k = ( 0.7 - d ) / d;
-			pos.x += dx * k; pos.z += dz * k;
-		}
+	for ( const t of treeSpots ) pushOut( pos, t.x, t.z, 0.7 );
+	for ( const o of obstacles ) {
+		// nächster Punkt auf der Strecke a–b
+		const ex = o.bx - o.ax, ez = o.bz - o.az, len2 = ex * ex + ez * ez;
+		const t = len2 > 0 ? Math.max( 0, Math.min( 1, ( ( pos.x - o.ax ) * ex + ( pos.z - o.az ) * ez ) / len2 ) ) : 0;
+		pushOut( pos, o.ax + ex * t, o.az + ez * t, o.r );
 	}
 	const r = Math.hypot( pos.x, pos.z );
 	if ( r > 110 ) { pos.x *= 110 / r; pos.z *= 110 / r; }
 }
 
 function vrLocomotion( dt ) {
+	if ( ! inVR ) return;
 	const session = renderer.xr.getSession();
 	if ( ! session ) return;
 	let move = [ 0, 0 ], turn = 0;
@@ -751,12 +777,16 @@ function vrLocomotion( dt ) {
 	}
 
 	const xrCam = renderer.xr.getCamera();
-	xrCam.getWorldPosition( _head );
+	// matrixWorld der XR-Kamera enthält schon das Rig (Position + Drehung); getWorldPosition() würde sie ohne Rig neu berechnen
+	_head.setFromMatrixPosition( xrCam.matrixWorld );
+	lastVRHead.copy( _head );
+	_fwd.set( 0, 0, - 1 ).transformDirection( xrCam.matrixWorld );
+	lastVRYaw = Math.atan2( - _fwd.x, - _fwd.z );
 	const rx0 = rig.position.x, rz0 = rig.position.z;
 
 	const mx = dead( move[ 0 ] ), my = dead( move[ 1 ] );
 	if ( mx || my ) {
-		xrCam.getWorldDirection( _fwd );
+		_fwd.set( 0, 0, - 1 ).transformDirection( xrCam.matrixWorld );
 		_fwd.y = 0;
 		if ( _fwd.lengthSq() < 1e-4 ) _fwd.set( 0, 0, - 1 );
 		_fwd.normalize();
@@ -782,10 +812,58 @@ function vrLocomotion( dt ) {
 	rig.position.y = terrainHeight( p.x, p.z );
 }
 
+// --- Egoperspektive am PC -------------------------------------------------
+//   Klick ins Bild: Maus wird eingefangen (Pointer Lock) -> Maus = umsehen
+//   W/A/S/D oder Pfeiltasten = laufen, Shift = rennen, Leertaste = springen, Esc = Maus frei (Menü)
+//   Ohne Pointer Lock geht Umsehen auch mit gedrückter linker Maustaste.
+
+const EYE = 1.7, WALK = 3.0, RUN = 7.0, JUMP = 5.5, GRAVITY = 16;
+const player = { pos: new THREE.Vector3( 0, 0, 11 ), vel: new THREE.Vector3(), vy: 0, y: 0, yaw: 0, pitch: - 0.05, onGround: true, bob: 0 };
+player.y = terrainHeight( player.pos.x, player.pos.z );
+
 const keys = new Set();
-window.addEventListener( 'keydown', e => { if ( ! e.target.closest?.( '.lil-gui' ) ) keys.add( e.code ); } );
+const isGuiEvent = e => !! e.target.closest?.( '.lil-gui' );
+window.addEventListener( 'keydown', e => {
+	if ( isGuiEvent( e ) ) return;
+	keys.add( e.code );
+	if ( e.code === 'Space' && player.onGround && ! renderer.xr.isPresenting ) { player.vy = JUMP; player.onGround = false; }
+	if ( [ 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight' ].includes( e.code ) ) e.preventDefault();
+} );
 window.addEventListener( 'keyup', e => keys.delete( e.code ) );
 window.addEventListener( 'blur', () => keys.clear() );
+
+const hint = document.getElementById( 'hint' );
+let dragging = false;
+function look( dx, dy ) {
+	player.yaw -= dx * 0.0022;
+	player.pitch = THREE.MathUtils.clamp( player.pitch - dy * 0.0022, - 1.45, 1.45 );
+}
+renderer.domElement.addEventListener( 'mousedown', e => {
+	if ( e.button !== 0 ) return;
+	dragging = true;
+	hint.style.display = 'none';
+	try {
+		const r = renderer.domElement.requestPointerLock();
+		if ( r && r.catch ) r.catch( () => {} );
+	} catch ( err ) { /* Pointer Lock nicht verfügbar -> Ziehen mit gedrückter Maus */ }
+} );
+window.addEventListener( 'mouseup', () => { dragging = false; } );
+window.addEventListener( 'mousemove', e => {
+	if ( renderer.xr.isPresenting ) return;
+	if ( document.pointerLockElement === renderer.domElement || dragging ) look( e.movementX, e.movementY );
+} );
+document.addEventListener( 'pointerlockchange', () => {
+	hint.style.display = document.pointerLockElement ? 'none' : 'block';
+} );
+
+function applyPlayerCamera( dt ) {
+	// leichtes Kopfwippen beim Gehen
+	const speed = Math.hypot( player.vel.x, player.vel.z );
+	if ( player.onGround && speed > 0.3 ) player.bob += dt * speed * 2.2;
+	const bob = Math.sin( player.bob ) * 0.035 * Math.min( speed / WALK, 1.5 );
+	camera.position.set( player.pos.x, player.y + EYE + bob, player.pos.z );
+	camera.rotation.set( player.pitch, player.yaw, 0 );
+}
 
 function desktopMove( dt ) {
 	let f = 0, r = 0;
@@ -793,19 +871,32 @@ function desktopMove( dt ) {
 	if ( keys.has( 'KeyS' ) || keys.has( 'ArrowDown' ) ) f -= 1;
 	if ( keys.has( 'KeyD' ) || keys.has( 'ArrowRight' ) ) r += 1;
 	if ( keys.has( 'KeyA' ) || keys.has( 'ArrowLeft' ) ) r -= 1;
-	if ( ! f && ! r ) return;
-	const speed = ( keys.has( 'ShiftLeft' ) || keys.has( 'ShiftRight' ) ? 12 : 4 ) * dt;
-	camera.getWorldDirection( _fwd );
-	_fwd.y = 0; _fwd.normalize();
+	const run = keys.has( 'ShiftLeft' ) || keys.has( 'ShiftRight' );
+
+	// Laufrichtung nur aus dem Yaw: Hoch-/Runterschauen ändert die Richtung nicht
+	_fwd.set( - Math.sin( player.yaw ), 0, - Math.cos( player.yaw ) );
 	_right.set( - _fwd.z, 0, _fwd.x );
-	const delta = new THREE.Vector3().addScaledVector( _fwd, f * speed ).addScaledVector( _right, r * speed );
-	const p = { x: controls.target.x + delta.x, z: controls.target.z + delta.z };
+	const target = new THREE.Vector3().addScaledVector( _fwd, f ).addScaledVector( _right, r );
+	if ( target.lengthSq() > 1 ) target.normalize();
+	target.multiplyScalar( run ? RUN : WALK );
+
+	// sanft beschleunigen/abbremsen (in der Luft weniger Kontrolle)
+	const accel = player.onGround ? 12 : 3;
+	player.vel.lerp( target, 1 - Math.exp( - accel * dt ) );
+
+	const p = { x: player.pos.x + player.vel.x * dt, z: player.pos.z + player.vel.z * dt };
 	pushOutOfTrees( p );
-	delta.x = p.x - controls.target.x; delta.z = p.z - controls.target.z;
-	delta.y = terrainHeight( p.x, p.z ) + 1.2 - controls.target.y;
-	controls.target.add( delta );
-	camera.position.add( delta );
+	player.pos.x = p.x; player.pos.z = p.z;
+
+	// Springen / Schwerkraft / Boden
+	const ground = terrainHeight( player.pos.x, player.pos.z );
+	player.vy -= GRAVITY * dt;
+	player.y += player.vy * dt;
+	if ( player.y <= ground ) { player.y = ground; player.vy = 0; player.onGround = true; }
+
+	applyPlayerCamera( dt );
 }
+applyPlayerCamera( 0 );
 
 // ---------------------------------------------------------------------------
 // Bedienoberfläche
@@ -868,7 +959,7 @@ function updateInfo() {
 	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA 4x${ settings.bloom ? ' + Bloom' : '' }` : `AA: ${ settings.aa }`;
 	info.innerHTML = `<b>${ backend }</b>  ·  ${ fps } FPS\n${ xr }\n` +
 		`Schatten: ${ settings.shadowType }, ${ settings.shadowRes }²\n` +
-		( renderer.xr.isPresenting ? `Linker Stick: laufen · Rechter Stick: drehen` : `WASD: laufen · Maus: umsehen · Rad: zoomen` );
+		( renderer.xr.isPresenting ? `Linker Stick: laufen · Rechter Stick: drehen` : `Esc: Maus frei für das Menü` );
 }
 
 window.addEventListener( 'resize', () => {
@@ -897,13 +988,12 @@ function animate() {
 		renderer.render( scene, camera ); // in VR direkt rendern (MSAA des XR-Framebuffers)
 	} else {
 		desktopMove( dt );
-		controls.update();
 		pipeline.render();
 	}
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings, rig, camera, LOW, xrBloom: () => xrBloom };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, xrBloom: () => xrBloom };
 </script>
 </body>
 </html>
