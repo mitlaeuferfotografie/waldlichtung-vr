@@ -109,7 +109,8 @@ function terrainHeight( x, z ) {
 // ?emu = Quest-3-Emulator (IWER) zum Testen ohne Brille
 if ( new URLSearchParams( location.search ).has( 'emu' ) ) {
 	const { XRDevice, metaQuest3 } = await import( 'https://esm.sh/iwer@2.8.0' );
-	new XRDevice( metaQuest3 ).installRuntime( { forceInstall: true, polyfillLayers: true } );
+	window.__xrDevice = new XRDevice( metaQuest3 );
+	window.__xrDevice.installRuntime( { forceInstall: true, polyfillLayers: true } );
 }
 
 if ( ! navigator.gpu ) {
@@ -124,7 +125,10 @@ const hasXRGPU = typeof globalThis.XRGPUBinding !== 'undefined';
 const vrCapable = navigator.xr ? await navigator.xr.isSessionSupported( 'immersive-vr' ).catch( () => false ) : false;
 const forceWebGL = query.has( 'webgl' ) || ( ! query.has( 'webgpu' ) && vrCapable && ! hasXRGPU );
 
-let renderer = new THREE.WebGPURenderer( { antialias: true, forceWebGL } );
+// Auf VR-Geräten (oder mit ?low) weniger Details, damit es flüssig läuft; ?hoch erzwingt volle Details
+const LOW = ( vrCapable || query.has( 'low' ) ) && ! query.has( 'hoch' );
+
+let renderer = new THREE.WebGPURenderer( { antialias: true, forceWebGL, multiview: forceWebGL && query.has( 'mv' ) } );
 configureRenderer( renderer );
 document.body.appendChild( renderer.domElement );
 await renderer.init();
@@ -197,7 +201,7 @@ scene.add( hemi );
 
 const sun = new THREE.DirectionalLight( 0xffffff, 3.2 );
 sun.castShadow = true;
-sun.shadow.mapSize.set( 2048, 2048 );
+sun.shadow.mapSize.set( LOW ? 1024 : 2048, LOW ? 1024 : 2048 );
 sun.shadow.camera.left = - 45;
 sun.shadow.camera.right = 45;
 sun.shadow.camera.top = 45;
@@ -279,7 +283,7 @@ function updateSun() {
 // ---------------------------------------------------------------------------
 
 const grass = ( () => {
-	const COUNT = Number( query.get( 'gras' ) ) || ( vrCapable ? 35000 : 70000 ); // ?gras=20000 für schwache Geräte
+	const COUNT = Number( query.get( 'gras' ) ) || ( LOW ? 30000 : 70000 ); // ?gras=20000 für schwache Geräte
 	const SEG = 3; // Segmente pro Halm -> 2*SEG+1 Vertices
 	const vpb = SEG * 2 + 1;
 	const positions = new Float32Array( COUNT * vpb * 3 );
@@ -400,7 +404,7 @@ function spotFree( x, z, d ) {
 	return true;
 }
 
-for ( let tries = 0; treeSpots.length < 520 && tries < 20000; tries ++ ) {
+for ( let tries = 0; treeSpots.length < ( LOW ? 340 : 520 ) && tries < 20000; tries ++ ) {
 	const a = rand() * Math.PI * 2;
 	const r = CLEARING + 1.5 + Math.pow( rand(), 1.3 ) * 110;
 	const x = Math.cos( a ) * r, z = Math.sin( a ) * r;
@@ -424,7 +428,7 @@ for ( let tries = 0; treeSpots.length < 520 && tries < 20000; tries ++ ) {
 			const t = l / ( layers - 1 );
 			const rad = ( 2.6 - t * 1.9 ) * s;
 			const ch = ( 4.2 - t * 1.6 ) * s;
-			const cone = new THREE.ConeGeometry( rad, ch, 11, 2 );
+			const cone = new THREE.ConeGeometry( rad, ch, LOW ? 8 : 11, LOW ? 1 : 2 );
 			lumpy( cone, 0.08, l + x );
 			cone.translate( 0, H * ( 0.22 + t * 0.62 ) + ch * 0.5, 0 );
 			needles.push( tagTree( cone.rotateY( rot + l ).translate( x, y, z ), base, H, rnd ) );
@@ -437,7 +441,7 @@ for ( let tries = 0; treeSpots.length < 520 && tries < 20000; tries ++ ) {
 		const blobs = 4 + Math.floor( rand() * 3 );
 		for ( let k = 0; k < blobs; k ++ ) {
 			const br = rr( 1.8, 2.8 ) * s;
-			const ico = lumpy( new THREE.IcosahedronGeometry( br, 2 ), 0.18, k * 7 + x );
+			const ico = lumpy( new THREE.IcosahedronGeometry( br, LOW ? 1 : 2 ), 0.18, k * 7 + x );
 			ico.translate( rr( - 1.6, 1.6 ) * s, H * rr( 0.62, 0.92 ), rr( - 1.6, 1.6 ) * s );
 			leaves.push( tagTree( ico.rotateY( rot ).translate( x, y, z ), base, H, rnd ) );
 		}
@@ -608,7 +612,7 @@ const settings = {
 	exposure: 1.0,
 	shadows: true,
 	shadowType: 'PCF (weich)',
-	shadowRes: 2048,
+	shadowRes: LOW ? 1024 : 2048,
 	grassShadows: false,
 	showShadowCam: false
 };
@@ -651,18 +655,133 @@ buildPipeline();
 const vrButton = VRButton.createButton( renderer, renderer.backend.isWebGPUBackend ? { requiredFeatures: [ 'webgpu' ] } : {} );
 document.body.appendChild( vrButton );
 
+let savedClouds = 0;
 function onSessionStart() {
 	rig.position.set( 0, 0, 6 );
+	rig.rotation.set( 0, 0, 0 );
+	savedClouds = sky.cloudCoverage.value;
+	if ( LOW ) sky.cloudCoverage.value = 0; // Wolken-Shader kostet pro Pixel viel
+	renderer.xr.setFoveation( 1 ); // Ränder des Blickfelds gröber rendern (Quest)
 	updateInfo();
 }
 function onSessionEnd() {
+	sky.cloudCoverage.value = savedClouds;
 	rig.position.set( 0, 0, 0 );
+	rig.rotation.set( 0, 0, 0 );
 	camera.position.set( 0, 2.6, 11 );
 	controls.update();
 	updateInfo();
 }
 renderer.xr.addEventListener( 'sessionstart', onSessionStart );
 renderer.xr.addEventListener( 'sessionend', onSessionEnd );
+
+// ---------------------------------------------------------------------------
+// Fortbewegung
+//   VR:  linker Stick = laufen (in Blickrichtung), rechter Stick = drehen (30°-Schritte)
+//   PC:  W/A/S/D oder Pfeiltasten, Shift = schneller
+// ---------------------------------------------------------------------------
+
+// sichtbare Controller (einfache Griffe), hängen am Rig und bewegen sich mit
+{
+	const handMat = new THREE.MeshStandardNodeMaterial( { color: 0x333333, roughness: 0.5 } );
+	const handGeo = new THREE.BoxGeometry( 0.035, 0.035, 0.12 );
+	for ( let i = 0; i < 2; i ++ ) {
+		const grip = renderer.xr.getControllerGrip( i );
+		grip.add( new THREE.Mesh( handGeo, handMat ) );
+		rig.add( grip );
+	}
+}
+
+const WALK_SPEED = 2.2;          // m/s in VR
+const UP = new THREE.Vector3( 0, 1, 0 );
+const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _head = new THREE.Vector3();
+let snapReady = true;
+
+function stickOf( src ) {
+	const a = src.gamepad ? src.gamepad.axes : [];
+	return a.length >= 4 ? [ a[ 2 ], a[ 3 ] ] : [ a[ 0 ] || 0, a[ 1 ] || 0 ];
+}
+const dead = v => Math.abs( v ) < 0.15 ? 0 : v;
+
+// verhindert, dass man durch Baumstämme läuft
+function pushOutOfTrees( pos ) {
+	for ( const t of treeSpots ) {
+		const dx = pos.x - t.x, dz = pos.z - t.z, d2 = dx * dx + dz * dz;
+		if ( d2 < 0.49 && d2 > 1e-6 ) {
+			const d = Math.sqrt( d2 ), k = ( 0.7 - d ) / d;
+			pos.x += dx * k; pos.z += dz * k;
+		}
+	}
+	const r = Math.hypot( pos.x, pos.z );
+	if ( r > 110 ) { pos.x *= 110 / r; pos.z *= 110 / r; }
+}
+
+function vrLocomotion( dt ) {
+	const session = renderer.xr.getSession();
+	if ( ! session ) return;
+	let move = [ 0, 0 ], turn = 0;
+	for ( const src of session.inputSources ) {
+		if ( ! src.gamepad ) continue;
+		if ( src.handedness === 'left' ) move = stickOf( src );
+		else if ( src.handedness === 'right' ) turn = stickOf( src )[ 0 ];
+	}
+
+	const xrCam = renderer.xr.getCamera();
+	xrCam.getWorldPosition( _head );
+	const rx0 = rig.position.x, rz0 = rig.position.z;
+
+	const mx = dead( move[ 0 ] ), my = dead( move[ 1 ] );
+	if ( mx || my ) {
+		xrCam.getWorldDirection( _fwd );
+		_fwd.y = 0;
+		if ( _fwd.lengthSq() < 1e-4 ) _fwd.set( 0, 0, - 1 );
+		_fwd.normalize();
+		_right.set( - _fwd.z, 0, _fwd.x );
+		rig.position.addScaledVector( _fwd, - my * WALK_SPEED * dt ).addScaledVector( _right, mx * WALK_SPEED * dt );
+	}
+
+	if ( snapReady && Math.abs( turn ) > 0.7 ) {
+		snapReady = false;
+		const angle = - Math.sign( turn ) * Math.PI / 6;
+		// um die Kopfposition drehen, nicht um den Rig-Ursprung
+		rig.position.sub( _head ).applyAxisAngle( UP, angle ).add( _head );
+		rig.rotation.y += angle;
+	} else if ( Math.abs( turn ) < 0.3 ) snapReady = true;
+
+	// Kopf-Position nach der Bewegung abschätzen, Kollision + Gelände folgen
+	if ( ! mx && ! my ) return;
+	const hx = _head.x + rig.position.x - rx0, hz = _head.z + rig.position.z - rz0;
+	const p = { x: hx, z: hz };
+	pushOutOfTrees( p );
+	rig.position.x += p.x - hx;
+	rig.position.z += p.z - hz;
+	rig.position.y = terrainHeight( p.x, p.z );
+}
+
+const keys = new Set();
+window.addEventListener( 'keydown', e => { if ( ! e.target.closest?.( '.lil-gui' ) ) keys.add( e.code ); } );
+window.addEventListener( 'keyup', e => keys.delete( e.code ) );
+window.addEventListener( 'blur', () => keys.clear() );
+
+function desktopMove( dt ) {
+	let f = 0, r = 0;
+	if ( keys.has( 'KeyW' ) || keys.has( 'ArrowUp' ) ) f += 1;
+	if ( keys.has( 'KeyS' ) || keys.has( 'ArrowDown' ) ) f -= 1;
+	if ( keys.has( 'KeyD' ) || keys.has( 'ArrowRight' ) ) r += 1;
+	if ( keys.has( 'KeyA' ) || keys.has( 'ArrowLeft' ) ) r -= 1;
+	if ( ! f && ! r ) return;
+	const speed = ( keys.has( 'ShiftLeft' ) || keys.has( 'ShiftRight' ) ? 12 : 4 ) * dt;
+	camera.getWorldDirection( _fwd );
+	_fwd.y = 0; _fwd.normalize();
+	_right.set( - _fwd.z, 0, _fwd.x );
+	const delta = new THREE.Vector3().addScaledVector( _fwd, f * speed ).addScaledVector( _right, r * speed );
+	const p = { x: controls.target.x + delta.x, z: controls.target.z + delta.z };
+	pushOutOfTrees( p );
+	delta.x = p.x - controls.target.x; delta.z = p.z - controls.target.z;
+	delta.y = terrainHeight( p.x, p.z ) + 1.2 - controls.target.y;
+	controls.target.add( delta );
+	camera.position.add( delta );
+}
 
 // ---------------------------------------------------------------------------
 // Bedienoberfläche
@@ -725,7 +844,7 @@ function updateInfo() {
 	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA` : `AA: ${ settings.aa }`;
 	info.innerHTML = `<b>${ backend }</b>  ·  ${ fps } FPS\n${ xr }\n` +
 		`Schatten: ${ settings.shadowType }, ${ settings.shadowRes }²\n` +
-		`Maus: drehen · Rechtsklick: schieben · Rad: zoomen`;
+		( renderer.xr.isPresenting ? `Linker Stick: laufen · Rechter Stick: drehen` : `WASD: laufen · Maus: umsehen · Rad: zoomen` );
 }
 
 window.addEventListener( 'resize', () => {
@@ -737,25 +856,30 @@ window.addEventListener( 'resize', () => {
 updateSun();
 updateInfo();
 
+let prevT = performance.now();
 function animate() {
 	frames ++;
 	const now = performance.now();
+	const dt = Math.min( ( now - prevT ) / 1000, 0.1 );
+	prevT = now;
 	if ( now - lastT > 500 ) {
 		fps = Math.round( frames * 1000 / ( now - lastT ) );
 		frames = 0; lastT = now;
-		updateInfo();
+		if ( ! renderer.xr.isPresenting ) updateInfo();
 	}
 
 	if ( renderer.xr.isPresenting ) {
+		vrLocomotion( dt );
 		renderer.render( scene, camera ); // in VR direkt rendern (MSAA des XR-Framebuffers)
 	} else {
+		desktopMove( dt );
 		controls.update();
 		pipeline.render();
 	}
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, LOW };
 </script>
 </body>
 </html>
