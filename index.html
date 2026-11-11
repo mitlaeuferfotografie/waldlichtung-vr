@@ -13,6 +13,11 @@
 		font-size: 13px; line-height: 1.45; pointer-events: none; white-space: pre;
 	}
 	#info b { color: #ffd479; }
+	#errlog {
+		position: fixed; left: 12px; bottom: 70px; right: 12px; z-index: 11; display: none;
+		color: #fff; background: rgba(160,20,20,.85); padding: 8px 12px; border-radius: 8px;
+		font: 12px/1.4 monospace; white-space: pre-wrap;
+	}
 	#error {
 		position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
 		color: #fff; background: #222; padding: 2em; text-align: center; font-size: 18px;
@@ -32,6 +37,25 @@
 <body>
 <div id="info">Lade …</div>
 <div id="error"></div>
+<div id="errlog"></div>
+<script>
+	// Fehler sichtbar auf der Seite anzeigen (hilfreich auf der VR-Brille, dort gibt es keine Konsole)
+	( function () {
+		const seen = new Set();
+		function show( msg ) {
+			msg = String( msg ).slice( 0, 300 );
+			if ( seen.has( msg ) || seen.size > 5 ) return;
+			seen.add( msg );
+			const box = document.getElementById( 'errlog' );
+			box.style.display = 'block';
+			box.textContent += ( box.textContent ? '
+' : '' ) + '⚠ ' + msg;
+		}
+		window.addEventListener( 'error', e => show( e.message || e.error ) );
+		window.addEventListener( 'unhandledrejection', e => show( e.reason && ( e.reason.message || e.reason ) ) );
+		window.__showError = show;
+	} )();
+</script>
 
 <script type="module">
 import * as THREE from 'three/webgpu';
@@ -43,7 +67,6 @@ import {
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
-import { setupWebGLXRFallback } from 'three/addons/webxr/WebGLXRFallback.js';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import { smaa } from 'three/addons/tsl/display/SMAANode.js';
@@ -83,14 +106,30 @@ function terrainHeight( x, z ) {
 // Renderer, Szene, Kamera
 // ---------------------------------------------------------------------------
 
+// ?emu = Quest-3-Emulator (IWER) zum Testen ohne Brille
+if ( new URLSearchParams( location.search ).has( 'emu' ) ) {
+	const { XRDevice, metaQuest3 } = await import( 'https://esm.sh/iwer@2.8.0' );
+	new XRDevice( metaQuest3 ).installRuntime( { forceInstall: true, polyfillLayers: true } );
+}
+
 if ( ! navigator.gpu ) {
 	console.warn( 'WebGPU nicht verfügbar – three.js nutzt automatisch WebGL 2.' );
 }
 
-let renderer = new THREE.WebGPURenderer( { antialias: true } );
+// Technik beim Laden festlegen (ein Wechsel mitten im VR-Start führte zu schwarzem Bild):
+// - Gerät kann VR, aber kein WebGPU-XR (z. B. Quest-Browser) -> gleich WebGL 2
+// - sonst WebGPU. Erzwingen per ?webgl oder ?webgpu
+const query = new URLSearchParams( location.search );
+const hasXRGPU = typeof globalThis.XRGPUBinding !== 'undefined';
+const vrCapable = navigator.xr ? await navigator.xr.isSessionSupported( 'immersive-vr' ).catch( () => false ) : false;
+const forceWebGL = query.has( 'webgl' ) || ( ! query.has( 'webgpu' ) && vrCapable && ! hasXRGPU );
+
+let renderer = new THREE.WebGPURenderer( { antialias: true, forceWebGL } );
 configureRenderer( renderer );
 document.body.appendChild( renderer.domElement );
 await renderer.init();
+// Nur Emulator: IWER liefert framebuffer = null, three erwartet ein Objekt als WeakMap-Schlüssel
+if ( query.has( 'emu' ) && renderer.backend.state ) renderer.backend.state.currentDrawbuffers = new Map();
 
 function configureRenderer( r ) {
 	r.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) );
@@ -240,7 +279,7 @@ function updateSun() {
 // ---------------------------------------------------------------------------
 
 const grass = ( () => {
-	const COUNT = 70000;
+	const COUNT = Number( query.get( 'gras' ) ) || ( vrCapable ? 35000 : 70000 ); // ?gras=20000 für schwache Geräte
 	const SEG = 3; // Segmente pro Halm -> 2*SEG+1 Vertices
 	const vpb = SEG * 2 + 1;
 	const positions = new Float32Array( COUNT * vpb * 3 );
@@ -606,30 +645,10 @@ function buildPipeline() {
 buildPipeline();
 
 // ---------------------------------------------------------------------------
-// WebXR (VR) – nutzt WebGPU, falls der Browser XR+WebGPU kann, sonst WebGL-Fallback
+// WebXR (VR) – Backend wurde oben passend zum Gerät gewählt
 // ---------------------------------------------------------------------------
 
-const hasXRGPU = typeof globalThis.XRGPUBinding !== 'undefined';
-setupWebGLXRFallback( renderer, ( old ) => {
-	const r = new THREE.WebGPURenderer( { antialias: true, forceWebGL: true } );
-	configureRenderer( r );
-	r.shadowMap.type = old.shadowMap.type;
-	r.shadowMap.enabled = old.shadowMap.enabled;
-	r.toneMapping = old.toneMapping;
-	r.toneMappingExposure = old.toneMappingExposure;
-	return r;
-}, ( newRenderer, oldRenderer ) => {
-	oldRenderer.domElement.replaceWith( newRenderer.domElement );
-	renderer = newRenderer;
-	controls.disconnect();
-	controls.connect( renderer.domElement );
-	renderer.xr.addEventListener( 'sessionstart', onSessionStart );
-	renderer.xr.addEventListener( 'sessionend', onSessionEnd );
-	buildPipeline();
-	updateInfo();
-} );
-
-const vrButton = VRButton.createButton( renderer, { optionalFeatures: hasXRGPU ? [ 'webgpu' ] : [] } );
+const vrButton = VRButton.createButton( renderer, renderer.backend.isWebGPUBackend ? { requiredFeatures: [ 'webgpu' ] } : {} );
 document.body.appendChild( vrButton );
 
 function onSessionStart() {
@@ -702,7 +721,7 @@ const info = document.getElementById( 'info' );
 let fps = 0, frames = 0, lastT = performance.now();
 
 function updateInfo() {
-	const backend = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2 (Fallback)';
+	const backend = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2';
 	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA` : `AA: ${ settings.aa }`;
 	info.innerHTML = `<b>${ backend }</b>  ·  ${ fps } FPS\n${ xr }\n` +
 		`Schatten: ${ settings.shadowType }, ${ settings.shadowRes }²\n` +
