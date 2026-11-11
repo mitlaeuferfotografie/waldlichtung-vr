@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waldlichtung – WebGPU / WebXR Demo</title>
+<style>
+	html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+	canvas { display: block; }
+	#info {
+		position: fixed; left: 12px; top: 12px; z-index: 10;
+		color: #fff; background: rgba(0,0,0,.45); padding: 8px 12px; border-radius: 8px;
+		font-size: 13px; line-height: 1.45; pointer-events: none; white-space: pre;
+	}
+	#info b { color: #ffd479; }
+	#error {
+		position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+		color: #fff; background: #222; padding: 2em; text-align: center; font-size: 18px;
+	}
+</style>
+<script type="importmap">
+{
+	"imports": {
+		"three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js",
+		"three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.webgpu.js",
+		"three/tsl": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.tsl.js",
+		"three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"
+	}
+}
+</script>
+</head>
+<body>
+<div id="info">Lade …</div>
+<div id="error"></div>
+
+<script type="module">
+import * as THREE from 'three/webgpu';
+import {
+	Fn, uniform, attribute, uv, time, vec2, vec3, vec4, float, sin, cos, mix, smoothstep, pow, max, dot, normalize,
+	positionLocal, positionWorld, normalWorld, cameraPosition, mx_noise_float, mx_fractal_noise_float,
+	pass, mrt, output, velocity, renderOutput
+} from 'three/tsl';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { setupWebGLXRFallback } from 'three/addons/webxr/WebGLXRFallback.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
+import { smaa } from 'three/addons/tsl/display/SMAANode.js';
+import { traa } from 'three/addons/tsl/display/TRAANode.js';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
+
+// ---------------------------------------------------------------------------
+// Hilfsfunktionen
+// ---------------------------------------------------------------------------
+
+// Reproduzierbarer Zufall, damit der Wald bei jedem Laden gleich aussieht
+function mulberry32( a ) {
+	return function () {
+		a |= 0; a = a + 0x6D2B79F5 | 0;
+		let t = Math.imul( a ^ a >>> 15, 1 | a );
+		t = t + Math.imul( t ^ t >>> 7, 61 | t ) ^ t;
+		return ( ( t ^ t >>> 14 ) >>> 0 ) / 4294967296;
+	};
+}
+const rand = mulberry32( 1234 );
+const rr = ( a, b ) => a + ( b - a ) * rand();
+
+const CLEARING = 14; // Radius der Lichtung in Metern
+
+// Geländehöhe: flache Lichtung, sanfte Hügel im Wald
+function terrainHeight( x, z ) {
+	const r = Math.hypot( x, z );
+	const hills = Math.sin( x * 0.045 ) * Math.cos( z * 0.038 ) * 2.4
+		+ Math.sin( x * 0.13 + 1.3 ) * Math.sin( z * 0.11 + 0.4 ) * 0.7
+		+ Math.sin( x * 0.31 + z * 0.27 ) * 0.15;
+	const t = THREE.MathUtils.smoothstep( r, CLEARING * 0.8, CLEARING * 2.2 );
+	return hills * t + Math.sin( x * 0.4 ) * Math.cos( z * 0.35 ) * 0.06;
+}
+
+// ---------------------------------------------------------------------------
+// Renderer, Szene, Kamera
+// ---------------------------------------------------------------------------
+
+if ( ! navigator.gpu ) {
+	console.warn( 'WebGPU nicht verfügbar – three.js nutzt automatisch WebGL 2.' );
+}
+
+let renderer = new THREE.WebGPURenderer( { antialias: true } );
+configureRenderer( renderer );
+document.body.appendChild( renderer.domElement );
+await renderer.init();
+
+function configureRenderer( r ) {
+	r.setPixelRatio( Math.min( window.devicePixelRatio, 2 ) );
+	r.setSize( window.innerWidth, window.innerHeight );
+	r.toneMapping = THREE.AgXToneMapping;
+	r.toneMappingExposure = 1.0;
+	r.shadowMap.enabled = true;
+	r.shadowMap.type = THREE.PCFShadowMap;
+	r.xr.enabled = true;
+}
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2( 0xa9c4d6, 0.005 );
+
+const rig = new THREE.Group(); // in VR: Position des Spielers
+scene.add( rig );
+const camera = new THREE.PerspectiveCamera( 65, window.innerWidth / window.innerHeight, 0.1, 600 );
+camera.position.set( 0, 2.6, 11 );
+rig.add( camera );
+
+let controls = new OrbitControls( camera, renderer.domElement );
+controls.target.set( 0, 1.2, 0 );
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI * 0.53;
+controls.minDistance = 1.5;
+controls.maxDistance = 60;
+
+// ---------------------------------------------------------------------------
+// Uniforms, die mehrere Shader teilen
+// ---------------------------------------------------------------------------
+
+const U = {
+	windStrength: uniform( 1.0 ),
+	windSpeed: uniform( 1.0 ),
+	windDir: uniform( new THREE.Vector2( 1, 0.35 ).normalize() ),
+	sunDir: uniform( new THREE.Vector3( 0, 1, 0 ) ),
+	sunColor: uniform( new THREE.Color( 1, 1, 1 ) ),
+	translucency: uniform( 0.35 ),
+	fireflyGlow: uniform( 6.0 )
+};
+
+// Wind als TSL-Funktion: großräumige Böen (Noise) + schnelles Flattern (Sinus)
+const windAt = Fn( ( [ p, freq ] ) => {
+	const t = time.mul( U.windSpeed );
+	const gust = mx_noise_float( vec2( p.x.mul( 0.04 ).sub( t.mul( 0.25 ) ), p.y.mul( 0.04 ) ) ).mul( 0.5 ).add( 0.5 );
+	const flutter = sin( t.mul( freq ).add( p.x.mul( 0.7 ) ).add( p.y.mul( 0.5 ) ) ).mul( 0.35 );
+	return gust.add( flutter.mul( gust.add( 0.3 ) ) ).mul( U.windStrength );
+} );
+
+// ---------------------------------------------------------------------------
+// Himmel & Licht
+// ---------------------------------------------------------------------------
+
+const sky = new SkyMesh();
+sky.scale.setScalar( 4000 );
+sky.turbidity.value = 4;
+sky.rayleigh.value = 1.2;
+sky.mieCoefficient.value = 0.004;
+sky.mieDirectionalG.value = 0.85;
+sky.cloudCoverage.value = 0.35;
+scene.add( sky );
+
+const hemi = new THREE.HemisphereLight( 0xbfd8ff, 0x3a4a22, 0.9 );
+scene.add( hemi );
+
+const sun = new THREE.DirectionalLight( 0xffffff, 3.2 );
+sun.castShadow = true;
+sun.shadow.mapSize.set( 2048, 2048 );
+sun.shadow.camera.left = - 45;
+sun.shadow.camera.right = 45;
+sun.shadow.camera.top = 45;
+sun.shadow.camera.bottom = - 45;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 260;
+sun.shadow.bias = - 0.0004;
+sun.shadow.normalBias = 0.03;
+sun.shadow.radius = 3;
+scene.add( sun, sun.target );
+
+const shadowHelper = new THREE.CameraHelper( sun.shadow.camera );
+shadowHelper.visible = false;
+scene.add( shadowHelper );
+
+const params = {
+	sunElevation: 32,
+	sunAzimuth: 75,
+	fogDensity: 0.005
+};
+
+const _c1 = new THREE.Color(), _c2 = new THREE.Color();
+function updateSun() {
+	const phi = THREE.MathUtils.degToRad( 90 - params.sunElevation );
+	const theta = THREE.MathUtils.degToRad( params.sunAzimuth );
+	const dir = new THREE.Vector3().setFromSphericalCoords( 1, phi, theta );
+	sky.sunPosition.value.copy( dir );
+	U.sunDir.value.copy( dir );
+	sun.position.copy( dir ).multiplyScalar( 120 );
+	sun.target.position.set( 0, 0, 0 );
+
+	const e = THREE.MathUtils.clamp( params.sunElevation / 45, 0, 1 );
+	_c1.setRGB( 1.0, 0.55, 0.28 ); _c2.setRGB( 1.0, 0.97, 0.9 );
+	sun.color.copy( _c1 ).lerp( _c2, Math.sqrt( e ) );
+	U.sunColor.value.copy( sun.color );
+	sun.intensity = 0.6 + 2.8 * Math.sqrt( e );
+	hemi.intensity = 0.25 + 0.75 * e;
+
+	_c1.setRGB( 0.85, 0.55, 0.42 ); _c2.setRGB( 0.62, 0.74, 0.84 );
+	scene.fog.color.copy( _c1 ).lerp( _c2, Math.sqrt( e ) ).multiplyScalar( 0.35 + 0.65 * e );
+	shadowHelper.update();
+}
+
+// ---------------------------------------------------------------------------
+// Boden – Farbe komplett prozedural im Shader
+// ---------------------------------------------------------------------------
+
+{
+	const size = 400, seg = 220;
+	const geo = new THREE.PlaneGeometry( size, size, seg, seg );
+	geo.rotateX( - Math.PI / 2 );
+	const pos = geo.attributes.position;
+	for ( let i = 0; i < pos.count; i ++ ) pos.setY( i, terrainHeight( pos.getX( i ), pos.getZ( i ) ) );
+	geo.computeVertexNormals();
+
+	const mat = new THREE.MeshStandardNodeMaterial( { roughness: 0.95 } );
+	const p = positionWorld.xz;
+	const r = p.length();
+	const n1 = mx_fractal_noise_float( p.mul( 0.08 ), 4 ).mul( 0.5 ).add( 0.5 );
+	const n2 = mx_noise_float( p.mul( 0.9 ) ).mul( 0.5 ).add( 0.5 );
+	const grassC = mix( vec3( 0.10, 0.20, 0.035 ), vec3( 0.22, 0.32, 0.06 ), n1 );
+	const forestC = mix( vec3( 0.12, 0.085, 0.05 ), vec3( 0.20, 0.17, 0.08 ), n2 ); // Nadelstreu
+	const mossC = vec3( 0.09, 0.16, 0.05 );
+	const inForest = smoothstep( CLEARING * 0.9, CLEARING * 1.6, r.add( n1.mul( 6 ) ) );
+	let col = mix( grassC, mix( forestC, mossC, smoothstep( 0.45, 0.7, n1 ) ), inForest );
+	// kleiner Trampelpfad
+	const path = float( 1 ).sub( smoothstep( 0.4, 1.4, p.y.sub( sin( p.x.mul( 0.15 ) ).mul( 3 ) ).abs().add( n2.mul( 0.6 ) ) ) );
+	col = mix( col, vec3( 0.25, 0.19, 0.12 ), path.mul( 0.8 ) );
+	mat.colorNode = col.mul( n2.mul( 0.25 ).add( 0.85 ) );
+	mat.roughnessNode = mix( float( 0.95 ), float( 0.8 ), path );
+
+	const ground = new THREE.Mesh( geo, mat );
+	ground.receiveShadow = true;
+	scene.add( ground );
+}
+
+// ---------------------------------------------------------------------------
+// Gras – zehntausende Halme, im Vertex-Shader vom Wind gebogen
+// ---------------------------------------------------------------------------
+
+const grass = ( () => {
+	const COUNT = 70000;
+	const SEG = 3; // Segmente pro Halm -> 2*SEG+1 Vertices
+	const vpb = SEG * 2 + 1;
+	const positions = new Float32Array( COUNT * vpb * 3 );
+	const normals = new Float32Array( COUNT * vpb * 3 );
+	const uvs = new Float32Array( COUNT * vpb * 2 );
+	const winds = new Float32Array( COUNT * vpb * 3 );
+	const indices = new Uint32Array( COUNT * ( SEG * 2 - 1 + 1 ) * 3 );
+
+	let vi = 0, ii = 0;
+	for ( let b = 0; b < COUNT; b ++ ) {
+		// Dichte nimmt zum Waldrand hin ab
+		let x, z, r;
+		do {
+			const a = rand() * Math.PI * 2;
+			r = Math.sqrt( rand() ) * CLEARING * 1.75;
+			x = Math.cos( a ) * r; z = Math.sin( a ) * r;
+		} while ( r > CLEARING && rand() < ( r - CLEARING ) / ( CLEARING * 0.75 ) );
+
+		const y0 = terrainHeight( x, z );
+		const h = rr( 0.15, 0.42 ) * ( r > CLEARING ? 0.7 : 1 );
+		const w = rr( 0.025, 0.045 );
+		const rot = rand() * Math.PI * 2;
+		const lean = rr( 0.0, 0.25 );
+		const cx = Math.cos( rot ), sz = Math.sin( rot );
+		const rnd = rand();
+		const base = vi;
+
+		for ( let s = 0; s <= SEG; s ++ ) {
+			const t = s / SEG;
+			const ww = w * ( 1 - t * 0.85 );
+			const off = lean * t * t * h;
+			const sides = s === SEG ? [ 0.5 ] : [ 0, 1 ];
+			for ( const side of sides ) {
+				const lx = ( side - 0.5 ) * 2 * ( s === SEG ? 0 : ww );
+				positions[ vi * 3 ] = x + lx * cx + off * - sz;
+				positions[ vi * 3 + 1 ] = y0 + t * h;
+				positions[ vi * 3 + 2 ] = z + lx * sz + off * cx;
+				// Normalen nach oben gekippt -> weicheres, „flauschiges“ Licht
+				const nx = - sz * 0.35, nz = cx * 0.35;
+				const nl = Math.hypot( nx, 1, nz );
+				normals[ vi * 3 ] = nx / nl; normals[ vi * 3 + 1 ] = 1 / nl; normals[ vi * 3 + 2 ] = nz / nl;
+				uvs[ vi * 2 ] = side; uvs[ vi * 2 + 1 ] = t;
+				winds[ vi * 3 ] = x; winds[ vi * 3 + 1 ] = z; winds[ vi * 3 + 2 ] = rnd;
+				vi ++;
+			}
+		}
+		for ( let s = 0; s < SEG - 1; s ++ ) {
+			const a = base + s * 2;
+			indices[ ii ++ ] = a; indices[ ii ++ ] = a + 1; indices[ ii ++ ] = a + 2;
+			indices[ ii ++ ] = a + 1; indices[ ii ++ ] = a + 3; indices[ ii ++ ] = a + 2;
+		}
+		const a = base + ( SEG - 1 ) * 2;
+		indices[ ii ++ ] = a; indices[ ii ++ ] = a + 1; indices[ ii ++ ] = a + 2;
+	}
+
+	const geo = new THREE.BufferGeometry();
+	geo.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+	geo.setAttribute( 'normal', new THREE.BufferAttribute( normals, 3 ) );
+	geo.setAttribute( 'uv', new THREE.BufferAttribute( uvs, 2 ) );
+	geo.setAttribute( 'aWind', new THREE.BufferAttribute( winds, 3 ) );
+	geo.setIndex( new THREE.BufferAttribute( indices.subarray( 0, ii ), 1 ) );
+	geo.computeBoundingSphere();
+
+	const mat = new THREE.MeshStandardNodeMaterial( { side: THREE.DoubleSide, roughness: 0.75 } );
+	const aWind = attribute( 'aWind', 'vec3' );
+	const h = uv().y;
+	const bend = h.mul( h ).mul( windAt( aWind.xy, 3.1 ) ).mul( 0.35 );
+	mat.positionNode = positionLocal.add( vec3( U.windDir.x.mul( bend ), bend.mul( bend ).mul( - 0.5 ), U.windDir.y.mul( bend ) ) );
+
+	const patch = mx_noise_float( aWind.xy.mul( 0.15 ) ).mul( 0.5 ).add( 0.5 );
+	const baseC = vec3( 0.03, 0.08, 0.01 );
+	const tipC = mix( vec3( 0.25, 0.42, 0.07 ), vec3( 0.48, 0.48, 0.12 ), patch.mul( patch ) );
+	mat.colorNode = mix( baseC, tipC, pow( h, 0.8 ) ).mul( aWind.z.mul( 0.4 ).add( 0.8 ) );
+	// Durchscheinen: Gegenlicht lässt die Spitzen leuchten
+	const viewDir = normalize( positionWorld.sub( cameraPosition ) );
+	const back = pow( max( dot( viewDir, U.sunDir ), 0 ), 6 );
+	mat.emissiveNode = tipC.mul( U.sunColor ).mul( back.mul( h ).mul( U.translucency ) );
+
+	const mesh = new THREE.Mesh( geo, mat );
+	mesh.receiveShadow = true;
+	mesh.castShadow = false;
+	mesh.frustumCulled = false;
+	scene.add( mesh );
+	return mesh;
+} )();
+
+// ---------------------------------------------------------------------------
+// Bäume – Fichten & Laubbäume, Kronen schwanken im Wind (auch im Schatten!)
+// ---------------------------------------------------------------------------
+
+function tagTree( geo, base, height, rnd ) {
+	const n = geo.attributes.position.count;
+	const arr = new Float32Array( n * 4 );
+	for ( let i = 0; i < n; i ++ ) {
+		arr[ i * 4 ] = base.x; arr[ i * 4 + 1 ] = base.y; arr[ i * 4 + 2 ] = base.z; arr[ i * 4 + 3 ] = height + rnd;
+	}
+	geo.setAttribute( 'aTree', new THREE.BufferAttribute( arr, 4 ) );
+	return geo;
+}
+
+function lumpy( geo, amount, seed ) {
+	const p = geo.attributes.position;
+	const v = new THREE.Vector3();
+	for ( let i = 0; i < p.count; i ++ ) {
+		v.fromBufferAttribute( p, i );
+		const f = 1 + amount * ( Math.sin( v.x * 3.1 + seed ) * Math.sin( v.y * 2.7 + seed * 2 ) * Math.sin( v.z * 3.3 + seed * 3 ) );
+		v.multiplyScalar( f );
+		p.setXYZ( i, v.x, v.y, v.z );
+	}
+	geo.computeVertexNormals();
+	return geo;
+}
+
+const trunks = [], needles = [], leaves = [];
+const treeSpots = [];
+function spotFree( x, z, d ) {
+	for ( const s of treeSpots ) if ( ( s.x - x ) ** 2 + ( s.z - z ) ** 2 < d * d ) return false;
+	return true;
+}
+
+for ( let tries = 0; treeSpots.length < 520 && tries < 20000; tries ++ ) {
+	const a = rand() * Math.PI * 2;
+	const r = CLEARING + 1.5 + Math.pow( rand(), 1.3 ) * 110;
+	const x = Math.cos( a ) * r, z = Math.sin( a ) * r;
+	if ( ! spotFree( x, z, r < 40 ? 3.2 : 4.2 ) ) continue;
+	treeSpots.push( { x, z } );
+
+	const y = terrainHeight( x, z ) - 0.2;
+	const base = new THREE.Vector3( x, y, z );
+	const conifer = rand() < 0.62;
+	const s = rr( 0.75, 1.35 );
+	const rot = rand() * Math.PI * 2;
+	const rnd = rand() * 0.99;
+
+	if ( conifer ) {
+		const H = Math.round( 11 * s );
+		const tr = new THREE.CylinderGeometry( 0.12 * s, 0.3 * s, H * 0.55, 7 );
+		tr.translate( 0, H * 0.275, 0 );
+		trunks.push( tagTree( tr.rotateY( rot ).translate( x, y, z ), base, H, rnd ) );
+		const layers = 5;
+		for ( let l = 0; l < layers; l ++ ) {
+			const t = l / ( layers - 1 );
+			const rad = ( 2.6 - t * 1.9 ) * s;
+			const ch = ( 4.2 - t * 1.6 ) * s;
+			const cone = new THREE.ConeGeometry( rad, ch, 11, 2 );
+			lumpy( cone, 0.08, l + x );
+			cone.translate( 0, H * ( 0.22 + t * 0.62 ) + ch * 0.5, 0 );
+			needles.push( tagTree( cone.rotateY( rot + l ).translate( x, y, z ), base, H, rnd ) );
+		}
+	} else {
+		const H = Math.round( 10 * s );
+		const tr = new THREE.CylinderGeometry( 0.18 * s, 0.38 * s, H * 0.7, 8 );
+		tr.translate( 0, H * 0.35, 0 );
+		trunks.push( tagTree( tr.rotateY( rot ).translate( x, y, z ), base, H, rnd ) );
+		const blobs = 4 + Math.floor( rand() * 3 );
+		for ( let k = 0; k < blobs; k ++ ) {
+			const br = rr( 1.8, 2.8 ) * s;
+			const ico = lumpy( new THREE.IcosahedronGeometry( br, 2 ), 0.18, k * 7 + x );
+			ico.translate( rr( - 1.6, 1.6 ) * s, H * rr( 0.62, 0.92 ), rr( - 1.6, 1.6 ) * s );
+			leaves.push( tagTree( ico.rotateY( rot ).translate( x, y, z ), base, H, rnd ) );
+		}
+	}
+}
+
+// Umgestürzter Baumstamm auf der Lichtung (schöner Schattenwerfer)
+{
+	const log = new THREE.CylinderGeometry( 0.35, 0.42, 7, 12 );
+	log.rotateZ( Math.PI / 2 ).rotateY( 0.5 ).translate( - 3.5, terrainHeight( - 3.5, - 3 ) + 0.3, - 3 );
+	trunks.push( tagTree( log, new THREE.Vector3( 0, 50, 0 ), 1, 0 ) ); // aTree.y hoch -> kein Schwanken
+}
+
+function swayNode( amount ) {
+	const aTree = attribute( 'aTree', 'vec4' );
+	const H = aTree.w.floor();
+	const rnd = aTree.w.fract();
+	const rel = positionLocal.y.sub( aTree.y ).div( H ).clamp( 0, 1 );
+	const w = windAt( aTree.xz, float( 1.3 ).add( rnd ) ).mul( amount ).mul( rel.mul( rel ) ).mul( H.mul( 0.035 ) );
+	return positionLocal.add( vec3( U.windDir.x.mul( w ), 0, U.windDir.y.mul( w ) ) );
+}
+
+function foliageMaterial( dark, light, scale ) {
+	const mat = new THREE.MeshStandardNodeMaterial( { roughness: 0.85, flatShading: false } );
+	mat.positionNode = swayNode( 1.0 );
+	const n = mx_fractal_noise_float( positionWorld.mul( scale ), 3 ).mul( 0.5 ).add( 0.5 );
+	const aTree = attribute( 'aTree', 'vec4' );
+	const tint = aTree.w.fract().mul( 0.35 ).add( 0.8 );
+	const c = mix( vec3( ...dark ), vec3( ...light ), n ).mul( tint );
+	// Selbstverschattung: unten/innen dunkler
+	const heightAO = positionWorld.y.sub( aTree.y ).div( aTree.w.floor() ).clamp( 0, 1 ).mul( 0.6 ).add( 0.4 );
+	mat.colorNode = c.mul( heightAO );
+	// Gegenlicht-Transluzenz
+	const viewDir = normalize( positionWorld.sub( cameraPosition ) );
+	const back = pow( max( dot( viewDir, U.sunDir ), 0 ), 4 );
+	mat.emissiveNode = c.mul( U.sunColor ).mul( back.mul( U.translucency ).mul( 0.6 ) );
+	return mat;
+}
+
+const barkMat = new THREE.MeshStandardNodeMaterial( { roughness: 1 } );
+{
+	barkMat.positionNode = swayNode( 0.4 );
+	const p = positionWorld;
+	const stripes = mx_noise_float( vec3( p.x.mul( 6 ), p.y.mul( 0.6 ), p.z.mul( 6 ) ) ).mul( 0.5 ).add( 0.5 );
+	const fine = mx_noise_float( p.mul( 14 ) ).mul( 0.5 ).add( 0.5 );
+	const moss = smoothstep( 0.55, 0.85, normalWorld.y.mul( 0.5 ).add( fine.mul( 0.4 ) ).add( float( 1 ).sub( smoothstep( 0.0, 1.5, p.y.sub( attribute( 'aTree', 'vec4' ).y ) ) ).mul( 0.4 ) ) );
+	const bark = mix( vec3( 0.12, 0.08, 0.05 ), vec3( 0.28, 0.21, 0.15 ), stripes.mul( fine ) );
+	barkMat.colorNode = mix( bark, vec3( 0.12, 0.2, 0.05 ), moss );
+}
+
+const needleMat = foliageMaterial( [ 0.02, 0.07, 0.03 ], [ 0.06, 0.16, 0.06 ], 1.6 );
+const leafMat = foliageMaterial( [ 0.06, 0.16, 0.03 ], [ 0.22, 0.38, 0.07 ], 1.1 );
+
+for ( const [ list, mat ] of [ [ trunks, barkMat ], [ needles, needleMat ], [ leaves, leafMat ] ] ) {
+	const geo = mergeGeometries( list.map( g => ( g.index ? g.toNonIndexed() : g ) ) );
+	const mesh = new THREE.Mesh( geo, mat );
+	mesh.castShadow = true;
+	mesh.receiveShadow = true;
+	mesh.frustumCulled = false;
+	scene.add( mesh );
+}
+
+// ---------------------------------------------------------------------------
+// Felsen mit Moos (Moos wächst im Shader auf nach oben zeigenden Flächen)
+// ---------------------------------------------------------------------------
+
+{
+	const rockMat = new THREE.MeshStandardNodeMaterial( { roughness: 0.9, flatShading: true } );
+	const p = positionWorld;
+	const n = mx_fractal_noise_float( p.mul( 2.5 ), 3 ).mul( 0.5 ).add( 0.5 );
+	const stone = mix( vec3( 0.22, 0.22, 0.21 ), vec3( 0.45, 0.44, 0.41 ), n );
+	const moss = smoothstep( 0.35, 0.75, normalWorld.y.add( n.mul( 0.5 ).sub( 0.2 ) ) );
+	rockMat.colorNode = mix( stone, vec3( 0.13, 0.24, 0.05 ), moss );
+	rockMat.roughnessNode = mix( float( 0.75 ), float( 1.0 ), moss );
+
+	const spots = [ [ 5, 2, 1.2 ], [ 6.2, 3.4, 0.6 ], [ - 6, 5, 0.9 ], [ 2, - 8, 1.6 ], [ - 9, - 6, 0.7 ], [ 9, - 5, 1.0 ], [ - 2, 9, 0.5 ] ];
+	for ( const [ x, z, s ] of spots ) {
+		const g = lumpy( new THREE.DodecahedronGeometry( 1, 1 ), 0.22, x * z );
+		g.scale( s * 1.3, s * 0.8, s );
+		const m = new THREE.Mesh( g, rockMat );
+		m.position.set( x, terrainHeight( x, z ) + s * 0.25, z );
+		m.rotation.y = rand() * 6;
+		m.castShadow = m.receiveShadow = true;
+		scene.add( m );
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Blumen & schwebende Glühwürmchen (HDR-Emission -> Bloom)
+// ---------------------------------------------------------------------------
+
+{
+	const parts = [];
+	const colors = [ [ 1, 1, 1 ], [ 1, 0.85, 0.2 ], [ 0.6, 0.4, 1 ], [ 1, 0.4, 0.5 ] ];
+	for ( let i = 0; i < 900; i ++ ) {
+		const a = rand() * Math.PI * 2, r = Math.sqrt( rand() ) * CLEARING * 0.95;
+		const x = Math.cos( a ) * r, z = Math.sin( a ) * r;
+		const y = terrainHeight( x, z ) + rr( 0.2, 0.5 );
+		const g = new THREE.IcosahedronGeometry( rr( 0.03, 0.06 ), 0 );
+		g.scale( 1, 0.5, 1 ).translate( x, y, z );
+		const c = colors[ Math.floor( rand() * colors.length ) ];
+		const n = g.attributes.position.count;
+		const col = new Float32Array( n * 3 ), wnd = new Float32Array( n * 3 );
+		for ( let k = 0; k < n; k ++ ) {
+			col.set( c, k * 3 );
+			wnd.set( [ x, z, ( y - terrainHeight( x, z ) ) / 0.65 ], k * 3 );
+		}
+		g.setAttribute( 'color', new THREE.BufferAttribute( col, 3 ) );
+		g.setAttribute( 'aWind', new THREE.BufferAttribute( wnd, 3 ) );
+		parts.push( g );
+	}
+	const geo = mergeGeometries( parts );
+	const mat = new THREE.MeshStandardNodeMaterial( { vertexColors: true, roughness: 0.6 } );
+	const aWind = attribute( 'aWind', 'vec3' );
+	const bend = aWind.z.mul( aWind.z ).mul( windAt( aWind.xy, 3.1 ) ).mul( 0.35 );
+	mat.positionNode = positionLocal.add( vec3( U.windDir.x.mul( bend ), 0, U.windDir.y.mul( bend ) ) );
+	const flowers = new THREE.Mesh( geo, mat );
+	flowers.receiveShadow = true;
+	flowers.frustumCulled = false;
+	scene.add( flowers );
+}
+
+const fireflies = ( () => {
+	const parts = [];
+	for ( let i = 0; i < 260; i ++ ) {
+		const a = rand() * Math.PI * 2, r = Math.sqrt( rand() ) * CLEARING * 1.3;
+		const x = Math.cos( a ) * r, z = Math.sin( a ) * r;
+		const y = terrainHeight( x, z ) + rr( 0.4, 3.0 );
+		const g = new THREE.OctahedronGeometry( 0.025, 0 );
+		g.deleteAttribute( 'uv' );
+		const n = g.attributes.position.count;
+		const pa = new Float32Array( n * 4 );
+		const phase = rand() * 100; // eine Phase pro Glühwürmchen, nicht pro Eckpunkt
+		for ( let k = 0; k < n; k ++ ) pa.set( [ x, y, z, phase ], k * 4 );
+		g.setAttribute( 'aP', new THREE.BufferAttribute( pa, 4 ) );
+		parts.push( g );
+	}
+	const geo = mergeGeometries( parts );
+	const mat = new THREE.MeshBasicNodeMaterial();
+	const aP = attribute( 'aP', 'vec4' );
+	const ph = aP.w;
+	const t = time.mul( 0.6 );
+	const drift = vec3(
+		sin( t.mul( 0.7 ).add( ph ) ).mul( 0.8 ).add( sin( t.mul( 1.9 ).add( ph.mul( 3 ) ) ).mul( 0.15 ) ),
+		sin( t.mul( 0.9 ).add( ph.mul( 2 ) ) ).mul( 0.35 ),
+		cos( t.mul( 0.6 ).add( ph.mul( 1.3 ) ) ).mul( 0.8 )
+	);
+	mat.positionNode = positionLocal.add( aP.xyz ).add( drift );
+	const blink = smoothstep( 0.2, 1.0, sin( time.mul( 2.0 ).add( ph.mul( 7 ) ) ).mul( 0.5 ).add( 0.5 ) ).add( 0.08 );
+	mat.colorNode = vec3( 1.0, 0.8, 0.3 ).mul( blink ).mul( U.fireflyGlow );
+	const mesh = new THREE.Mesh( geo, mat );
+	mesh.frustumCulled = false;
+	scene.add( mesh );
+	return mesh;
+} )();
+
+// ---------------------------------------------------------------------------
+// Post-Processing-Pipeline: Kantenglättung + Bloom
+// ---------------------------------------------------------------------------
+
+const settings = {
+	aa: 'MSAA 4x',
+	pixelRatio: Math.min( window.devicePixelRatio, 2 ),
+	bloom: true,
+	bloomStrength: 0.35,
+	bloomThreshold: 0.85,
+	toneMapping: 'AgX',
+	exposure: 1.0,
+	shadows: true,
+	shadowType: 'PCF (weich)',
+	shadowRes: 2048,
+	grassShadows: false,
+	showShadowCam: false
+};
+
+let pipeline, bloomPass;
+
+function buildPipeline() {
+	pipeline?.dispose?.();
+	pipeline = new THREE.RenderPipeline( renderer );
+	pipeline.outputColorTransform = false;
+
+	const mode = settings.aa;
+	const scenePass = pass( scene, camera, { samples: mode === 'MSAA 4x' ? 4 : 0 } );
+	let color;
+	if ( mode === 'TRAA (temporal)' ) {
+		scenePass.setMRT( mrt( { output, velocity } ) );
+		color = traa( scenePass.getTextureNode( 'output' ), scenePass.getTextureNode( 'depth' ), scenePass.getTextureNode( 'velocity' ), camera );
+	} else {
+		color = scenePass.getTextureNode( 'output' );
+	}
+
+	if ( settings.bloom ) {
+		bloomPass = bloom( color, settings.bloomStrength, 0.4, settings.bloomThreshold );
+		color = color.add( bloomPass );
+	} else bloomPass = null;
+
+	color = renderOutput( color );
+
+	if ( mode === 'FXAA' ) color = fxaa( color );
+	else if ( mode === 'SMAA' ) color = smaa( color );
+
+	pipeline.outputNode = color;
+}
+buildPipeline();
+
+// ---------------------------------------------------------------------------
+// WebXR (VR) – nutzt WebGPU, falls der Browser XR+WebGPU kann, sonst WebGL-Fallback
+// ---------------------------------------------------------------------------
+
+const hasXRGPU = typeof globalThis.XRGPUBinding !== 'undefined';
+setupWebGLXRFallback( renderer, ( old ) => {
+	const r = new THREE.WebGPURenderer( { antialias: true, forceWebGL: true } );
+	configureRenderer( r );
+	r.shadowMap.type = old.shadowMap.type;
+	r.shadowMap.enabled = old.shadowMap.enabled;
+	r.toneMapping = old.toneMapping;
+	r.toneMappingExposure = old.toneMappingExposure;
+	return r;
+}, ( newRenderer, oldRenderer ) => {
+	oldRenderer.domElement.replaceWith( newRenderer.domElement );
+	renderer = newRenderer;
+	controls.disconnect();
+	controls.connect( renderer.domElement );
+	renderer.xr.addEventListener( 'sessionstart', onSessionStart );
+	renderer.xr.addEventListener( 'sessionend', onSessionEnd );
+	buildPipeline();
+	updateInfo();
+} );
+
+const vrButton = VRButton.createButton( renderer, { optionalFeatures: hasXRGPU ? [ 'webgpu' ] : [] } );
+document.body.appendChild( vrButton );
+
+function onSessionStart() {
+	rig.position.set( 0, 0, 6 );
+	updateInfo();
+}
+function onSessionEnd() {
+	rig.position.set( 0, 0, 0 );
+	camera.position.set( 0, 2.6, 11 );
+	controls.update();
+	updateInfo();
+}
+renderer.xr.addEventListener( 'sessionstart', onSessionStart );
+renderer.xr.addEventListener( 'sessionend', onSessionEnd );
+
+// ---------------------------------------------------------------------------
+// Bedienoberfläche
+// ---------------------------------------------------------------------------
+
+const gui = new GUI( { title: 'Waldlichtung – Einstellungen' } );
+
+const fAA = gui.addFolder( 'Kantenglättung' );
+fAA.add( settings, 'aa', [ 'Aus', 'MSAA 4x', 'FXAA', 'SMAA', 'TRAA (temporal)' ] ).name( 'Verfahren' ).onChange( () => { buildPipeline(); updateInfo(); } );
+fAA.add( settings, 'pixelRatio', 0.5, 2, 0.25 ).name( 'Auflösung (Pixel-Ratio)' ).onChange( v => { renderer.setPixelRatio( v ); updateInfo(); } );
+
+const fSh = gui.addFolder( 'Schatten' );
+fSh.add( settings, 'shadows' ).name( 'Schatten an' ).onChange( v => { sun.castShadow = v; } );
+fSh.add( settings, 'shadowType', [ 'Basic (hart)', 'PCF (weich)', 'VSM (Varianz)' ] ).name( 'Filter' ).onChange( v => {
+	renderer.shadowMap.type = { 'Basic (hart)': THREE.BasicShadowMap, 'PCF (weich)': THREE.PCFShadowMap, 'VSM (Varianz)': THREE.VSMShadowMap }[ v ];
+	updateInfo();
+} );
+fSh.add( settings, 'shadowRes', [ 512, 1024, 2048, 4096 ] ).name( 'Shadow-Map-Größe' ).onChange( v => {
+	sun.shadow.mapSize.set( v, v );
+	updateInfo();
+} );
+fSh.add( sun.shadow, 'radius', 0, 12, 0.5 ).name( 'Weichheit (Radius)' );
+fSh.add( sun.shadow, 'blurSamples', 2, 24, 1 ).name( 'VSM-Samples' );
+fSh.add( sun.shadow, 'bias', - 0.003, 0.001, 0.0001 ).name( 'Bias' );
+fSh.add( sun.shadow, 'normalBias', 0, 0.2, 0.005 ).name( 'Normal-Bias' );
+fSh.add( settings, 'grassShadows' ).name( 'Gras wirft Schatten' ).onChange( v => { grass.castShadow = v; } );
+fSh.add( settings, 'showShadowCam' ).name( 'Schatten-Kamera zeigen' ).onChange( v => { shadowHelper.visible = v; } );
+
+const fLi = gui.addFolder( 'Licht & Himmel' );
+fLi.add( params, 'sunElevation', 1, 85, 0.5 ).name( 'Sonnenhöhe °' ).onChange( updateSun );
+fLi.add( params, 'sunAzimuth', 0, 360, 1 ).name( 'Sonnenrichtung °' ).onChange( updateSun );
+fLi.add( params, 'fogDensity', 0, 0.04, 0.001 ).name( 'Nebel' ).onChange( v => { scene.fog.density = v; } );
+fLi.add( sky.cloudCoverage, 'value', 0, 1, 0.01 ).name( 'Wolken' );
+fLi.add( settings, 'toneMapping', [ 'AgX', 'ACES Filmic', 'Neutral', 'Keins' ] ).name( 'Tone-Mapping' ).onChange( v => {
+	renderer.toneMapping = { 'AgX': THREE.AgXToneMapping, 'ACES Filmic': THREE.ACESFilmicToneMapping, 'Neutral': THREE.NeutralToneMapping, 'Keins': THREE.NoToneMapping }[ v ];
+	buildPipeline();
+} );
+fLi.add( settings, 'exposure', 0.2, 2.5, 0.05 ).name( 'Belichtung' ).onChange( v => { renderer.toneMappingExposure = v; } );
+
+const fFx = gui.addFolder( 'Shader-Effekte' );
+fFx.add( U.windStrength, 'value', 0, 3, 0.05 ).name( 'Windstärke' );
+fFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
+fFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
+fFx.add( U.fireflyGlow, 'value', 0, 20, 0.5 ).name( 'Glühwürmchen' );
+fFx.add( settings, 'bloom' ).name( 'Bloom' ).onChange( buildPipeline );
+fFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; } );
+fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onChange( v => { if ( bloomPass ) bloomPass.threshold.value = v; } );
+
+if ( window.innerWidth < 900 ) gui.close();
+
+// ---------------------------------------------------------------------------
+// Info-Anzeige, Resize, Render-Loop
+// ---------------------------------------------------------------------------
+
+const info = document.getElementById( 'info' );
+let fps = 0, frames = 0, lastT = performance.now();
+
+function updateInfo() {
+	const backend = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2 (Fallback)';
+	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA` : `AA: ${ settings.aa }`;
+	info.innerHTML = `<b>${ backend }</b>  ·  ${ fps } FPS\n${ xr }\n` +
+		`Schatten: ${ settings.shadowType }, ${ settings.shadowRes }²\n` +
+		`Maus: drehen · Rechtsklick: schieben · Rad: zoomen`;
+}
+
+window.addEventListener( 'resize', () => {
+	camera.aspect = window.innerWidth / window.innerHeight;
+	camera.updateProjectionMatrix();
+	renderer.setSize( window.innerWidth, window.innerHeight );
+} );
+
+updateSun();
+updateInfo();
+
+function animate() {
+	frames ++;
+	const now = performance.now();
+	if ( now - lastT > 500 ) {
+		fps = Math.round( frames * 1000 / ( now - lastT ) );
+		frames = 0; lastT = now;
+		updateInfo();
+	}
+
+	if ( renderer.xr.isPresenting ) {
+		renderer.render( scene, camera ); // in VR direkt rendern (MSAA des XR-Framebuffers)
+	} else {
+		controls.update();
+		pipeline.render();
+	}
+}
+renderer.setAnimationLoop( animate );
+
+window.__demo = { renderer: () => renderer, scene, settings };
+</script>
+</body>
+</html>
