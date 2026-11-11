@@ -78,6 +78,8 @@ import { smaa } from 'three/addons/tsl/display/SMAANode.js';
 import { traa } from 'three/addons/tsl/display/TRAANode.js';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import GUI from 'three/addons/libs/lil-gui.module.min.js';
+import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
+import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
 
 // ---------------------------------------------------------------------------
 // Hilfsfunktionen
@@ -697,6 +699,7 @@ function onSessionStart() {
 	savedClouds = sky.cloudCoverage.value;
 	if ( LOW ) sky.cloudCoverage.value = 0; // Wolken-Shader kostet pro Pixel viel
 	renderer.xr.setFoveation( 1 ); // Ränder des Blickfelds gröber rendern (Quest)
+	exitVRBtn.show();
 	updateInfo();
 }
 function onSessionEnd() {
@@ -711,6 +714,9 @@ function onSessionEnd() {
 	rig.position.set( 0, 0, 0 );
 	rig.rotation.set( 0, 0, 0 );
 	applyPlayerCamera( 0 );
+	setVRMenu( false );
+	for ( const c of gui.controllersRecursive() ) c.updateDisplay();
+	exitVRBtn.hide();
 	updateInfo();
 }
 renderer.xr.addEventListener( 'sessionstart', onSessionStart );
@@ -733,7 +739,7 @@ renderer.xr.addEventListener( 'sessionend', onSessionEnd );
 	}
 }
 
-const WALK_SPEED = 2.2;          // m/s in VR
+const vrOpts = { walkSpeed: 2.2, snapDeg: 30 }; // im VR-Menü einstellbar
 const UP = new THREE.Vector3( 0, 1, 0 );
 const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _head = new THREE.Vector3();
 let snapReady = true;
@@ -769,6 +775,7 @@ function vrLocomotion( dt ) {
 	if ( ! inVR ) return;
 	const session = renderer.xr.getSession();
 	if ( ! session ) return;
+	pollMenuButton( session );
 	let move = [ 0, 0 ], turn = 0;
 	for ( const src of session.inputSources ) {
 		if ( ! src.gamepad ) continue;
@@ -791,12 +798,12 @@ function vrLocomotion( dt ) {
 		if ( _fwd.lengthSq() < 1e-4 ) _fwd.set( 0, 0, - 1 );
 		_fwd.normalize();
 		_right.set( - _fwd.z, 0, _fwd.x );
-		rig.position.addScaledVector( _fwd, - my * WALK_SPEED * dt ).addScaledVector( _right, mx * WALK_SPEED * dt );
+		rig.position.addScaledVector( _fwd, - my * vrOpts.walkSpeed * dt ).addScaledVector( _right, mx * vrOpts.walkSpeed * dt );
 	}
 
 	if ( snapReady && Math.abs( turn ) > 0.7 ) {
 		snapReady = false;
-		const angle = - Math.sign( turn ) * Math.PI / 6;
+		const angle = - Math.sign( turn ) * THREE.MathUtils.degToRad( vrOpts.snapDeg );
 		// um die Kopfposition drehen, nicht um den Rig-Ursprung
 		rig.position.sub( _head ).applyAxisAngle( UP, angle ).add( _head );
 		rig.rotation.y += angle;
@@ -902,7 +909,21 @@ applyPlayerCamera( 0 );
 // Bedienoberfläche
 // ---------------------------------------------------------------------------
 
+const SHADOW_TYPES = { 'Basic (hart)': THREE.BasicShadowMap, 'PCF (weich)': THREE.PCFShadowMap, 'VSM (Varianz)': THREE.VSMShadowMap };
+function applyShadowType( v ) {
+	settings.shadowType = v;
+	renderer.shadowMap.type = SHADOW_TYPES[ v ];
+	updateInfo();
+}
+function applyShadowRes( v ) {
+	settings.shadowRes = v;
+	sun.shadow.mapSize.set( v, v );
+	updateInfo();
+}
+
 const gui = new GUI( { title: 'Waldlichtung – Einstellungen' } );
+const exitVRBtn = gui.add( { exit: () => exitVR() }, 'exit' ).name( '⏏  VR beenden' );
+exitVRBtn.hide();
 
 const fAA = gui.addFolder( 'Kantenglättung' );
 fAA.add( settings, 'aa', [ 'Aus', 'MSAA 4x', 'FXAA', 'SMAA', 'TRAA (temporal)' ] ).name( 'Verfahren' ).onChange( () => { buildPipeline(); updateInfo(); } );
@@ -910,14 +931,8 @@ fAA.add( settings, 'pixelRatio', 0.5, 2, 0.25 ).name( 'Auflösung (Pixel-Ratio)'
 
 const fSh = gui.addFolder( 'Schatten' );
 fSh.add( settings, 'shadows' ).name( 'Schatten an' ).onChange( v => { sun.castShadow = v; } );
-fSh.add( settings, 'shadowType', [ 'Basic (hart)', 'PCF (weich)', 'VSM (Varianz)' ] ).name( 'Filter' ).onChange( v => {
-	renderer.shadowMap.type = { 'Basic (hart)': THREE.BasicShadowMap, 'PCF (weich)': THREE.PCFShadowMap, 'VSM (Varianz)': THREE.VSMShadowMap }[ v ];
-	updateInfo();
-} );
-fSh.add( settings, 'shadowRes', [ 512, 1024, 2048, 4096 ] ).name( 'Shadow-Map-Größe' ).onChange( v => {
-	sun.shadow.mapSize.set( v, v );
-	updateInfo();
-} );
+fSh.add( settings, 'shadowType', Object.keys( SHADOW_TYPES ) ).name( 'Filter' ).onChange( applyShadowType );
+fSh.add( settings, 'shadowRes', [ 512, 1024, 2048, 4096 ] ).name( 'Shadow-Map-Größe' ).onChange( applyShadowRes );
 fSh.add( sun.shadow, 'radius', 0, 12, 0.5 ).name( 'Weichheit (Radius)' );
 fSh.add( sun.shadow, 'blurSamples', 2, 24, 1 ).name( 'VSM-Samples' );
 fSh.add( sun.shadow, 'bias', - 0.003, 0.001, 0.0001 ).name( 'Bias' );
@@ -948,6 +963,136 @@ fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onCha
 if ( window.innerWidth < 900 ) gui.close();
 
 // ---------------------------------------------------------------------------
+// VR-Menü: dasselbe lil-gui als Fläche in der 3D-Welt (HTMLMesh), bedient per Laserstrahl
+//   Öffnen/Schließen: Taste A/B/X/Y an einem Controller
+//   Klicken: Zeigefinger-Trigger; Schieberegler: Trigger halten und ziehen
+//   Hinweis: Ausklapplisten (select) kann HTMLMesh in VR nicht öffnen -> hier nur Knöpfe,
+//   Regler und Häkchen.
+// ---------------------------------------------------------------------------
+
+const vrMenuHost = document.createElement( 'div' );
+// sichtbar im Layout (HTMLMesh rechnet Klicks über Bildschirmkoordinaten um), aber unsichtbar und nicht anklickbar
+vrMenuHost.style.cssText = 'position:absolute; left:0; top:0; width:360px; visibility:hidden; pointer-events:none; z-index:-1;';
+document.body.appendChild( vrMenuHost );
+
+const vrGui = new GUI( { title: 'Waldlichtung – Einstellungen (VR)', container: vrMenuHost, width: 360 } );
+const vrActions = {
+	exit: exitVR,
+	close: () => setVRMenu( false ),
+	filter: () => {
+		const names = Object.keys( SHADOW_TYPES );
+		applyShadowType( names[ ( names.indexOf( settings.shadowType ) + 1 ) % names.length ] );
+		filterBtn.name( `Schatten-Filter: ${ settings.shadowType }` );
+	},
+	res: () => {
+		const list = [ 512, 1024, 2048, 4096 ];
+		applyShadowRes( list[ ( list.indexOf( settings.shadowRes ) + 1 ) % list.length ] );
+		resBtn.name( `Shadow-Map: ${ settings.shadowRes }²` );
+	}
+};
+vrGui.add( vrActions, 'close' ).name( '✕  Menü schließen' );
+vrGui.add( vrActions, 'exit' ).name( '⏏  VR beenden' );
+
+const vLi = vrGui.addFolder( 'Licht & Himmel' );
+vLi.add( params, 'sunElevation', 1, 85, 0.5 ).name( 'Sonnenhöhe °' ).onChange( updateSun );
+vLi.add( params, 'sunAzimuth', 0, 360, 1 ).name( 'Sonnenrichtung °' ).onChange( updateSun );
+vLi.add( params, 'fogDensity', 0, 0.04, 0.001 ).name( 'Nebel' ).onChange( v => { scene.fog.density = v; } );
+vLi.add( sky.cloudCoverage, 'value', 0, 1, 0.01 ).name( 'Wolken (kostet Leistung)' );
+vLi.add( settings, 'exposure', 0.2, 2.5, 0.05 ).name( 'Belichtung' ).onChange( v => { renderer.toneMappingExposure = v; } );
+
+const vSh = vrGui.addFolder( 'Schatten' );
+vSh.add( settings, 'shadows' ).name( 'Schatten an' ).onChange( v => { sun.castShadow = v; } );
+const filterBtn = vSh.add( vrActions, 'filter' ).name( `Schatten-Filter: ${ settings.shadowType }` );
+const resBtn = vSh.add( vrActions, 'res' ).name( `Shadow-Map: ${ settings.shadowRes }²` );
+vSh.add( sun.shadow, 'radius', 0, 12, 0.5 ).name( 'Weichheit (Radius)' );
+vSh.add( settings, 'grassShadows' ).name( 'Gras wirft Schatten' ).onChange( v => { grass.castShadow = v; } );
+
+const vFx = vrGui.addFolder( 'Shader-Effekte' );
+vFx.add( U.windStrength, 'value', 0, 3, 0.05 ).name( 'Windstärke' );
+vFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
+vFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
+vFx.add( U.fireflyGlow, 'value', 0, 20, 0.5 ).name( 'Glühwürmchen' );
+vFx.add( settings, 'bloom' ).name( 'Bloom' );
+vFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
+
+const vMo = vrGui.addFolder( 'Bewegung' );
+vMo.add( vrOpts, 'walkSpeed', 0.5, 6, 0.1 ).name( 'Laufgeschwindigkeit m/s' );
+vMo.add( vrOpts, 'snapDeg', 15, 90, 15 ).name( 'Drehschritt °' );
+
+// Häkchen: lil-gui legt sie in ein <label>. HTMLMesh klickt Label UND Häkchen an -> doppelt umgeschaltet.
+// Label durch ein <div> ersetzen, dann kommt genau ein Klick an.
+for ( const c of vrGui.controllersRecursive() ) {
+	if ( c.$input?.type !== 'checkbox' ) continue;
+	const label = c.$input.closest( 'label' );
+	if ( ! label ) continue;
+	const div = document.createElement( 'div' );
+	div.className = label.className;
+	while ( label.firstChild ) div.appendChild( label.firstChild );
+	label.replaceWith( div );
+}
+
+// Ordner nicht einklappbar: die Fläche in VR hat eine feste Größe
+for ( const f of [ vrGui, ...vrGui.foldersRecursive() ] ) f.close = () => f;
+
+const vrMenu = new InteractiveGroup();
+const vrMenuMesh = new HTMLMesh( vrGui.domElement );
+vrMenuMesh.scale.setScalar( 1.3 );
+vrMenuMesh.material.fog = false;
+vrMenuMesh.material.toneMapped = false;
+vrMenu.add( vrMenuMesh );
+
+// Laserstrahlen an beiden Controllern (nur sichtbar, solange das Menü offen ist)
+const rayGeo = new THREE.BufferGeometry().setFromPoints( [ new THREE.Vector3( 0, 0, 0 ), new THREE.Vector3( 0, 0, - 3 ) ] );
+const rayMat = new THREE.LineBasicMaterial( { color: 0xffd479, fog: false, toneMapped: false } );
+const rays = [];
+for ( let i = 0; i < 2; i ++ ) {
+	const controller = renderer.xr.getController( i );
+	const ray = new THREE.Line( rayGeo, rayMat );
+	ray.visible = false;
+	controller.add( ray );
+	rays.push( ray );
+	rig.add( controller );
+	vrMenu.listenToXRControllerEvents( controller );
+}
+
+let vrMenuOpen = false;
+function setVRMenu( open ) {
+	vrMenuOpen = open;
+	for ( const r of rays ) r.visible = open;
+	if ( ! open ) { scene.remove( vrMenu ); return; }
+	// Regler auf aktuelle Werte bringen (falls am PC geändert)
+	for ( const c of vrGui.controllersRecursive() ) c.updateDisplay();
+	// 0,9 m vor den Kopf, etwas unter Augenhöhe, zum Kopf gedreht
+	const xrCam = renderer.xr.getCamera();
+	const head = new THREE.Vector3().setFromMatrixPosition( xrCam.matrixWorld );
+	const dir = new THREE.Vector3( 0, 0, - 1 ).transformDirection( xrCam.matrixWorld );
+	dir.y = 0;
+	if ( dir.lengthSq() < 1e-4 ) dir.set( 0, 0, - 1 );
+	dir.normalize();
+	vrMenu.position.copy( head ).addScaledVector( dir, 0.9 );
+	vrMenu.position.y -= 0.2;
+	vrMenu.lookAt( head.x, vrMenu.position.y, head.z );
+	scene.add( vrMenu );
+}
+
+function exitVR() {
+	const session = renderer.xr.getSession();
+	if ( session ) session.end();
+}
+
+// Taste A/B/X/Y (Gamepad-Buttons 4 und 5) öffnet/schließt das Menü
+const menuButtonWasDown = new WeakMap();
+function pollMenuButton( session ) {
+	for ( const src of session.inputSources ) {
+		const b = src.gamepad?.buttons;
+		if ( ! b ) continue;
+		const down = !! ( b[ 4 ]?.pressed || b[ 5 ]?.pressed );
+		if ( down && ! menuButtonWasDown.get( src ) ) setVRMenu( ! vrMenuOpen );
+		menuButtonWasDown.set( src, down );
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Info-Anzeige, Resize, Render-Loop
 // ---------------------------------------------------------------------------
 
@@ -959,7 +1104,7 @@ function updateInfo() {
 	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA 4x${ settings.bloom ? ' + Bloom' : '' }` : `AA: ${ settings.aa }`;
 	info.innerHTML = `<b>${ backend }</b>  ·  ${ fps } FPS\n${ xr }\n` +
 		`Schatten: ${ settings.shadowType }, ${ settings.shadowRes }²\n` +
-		( renderer.xr.isPresenting ? `Linker Stick: laufen · Rechter Stick: drehen` : `Esc: Maus frei für das Menü` );
+		( renderer.xr.isPresenting ? `Linker Stick: laufen · Rechter Stick: drehen · A/B/X/Y: Menü` : `Esc: Maus frei für das Menü` );
 }
 
 window.addEventListener( 'resize', () => {
@@ -993,7 +1138,7 @@ function animate() {
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, xrBloom: () => xrBloom };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
 </script>
 </body>
 </html>
