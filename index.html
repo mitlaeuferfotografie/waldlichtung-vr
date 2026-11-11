@@ -62,7 +62,7 @@ import * as THREE from 'three/webgpu';
 import {
 	Fn, uniform, attribute, uv, time, vec2, vec3, vec4, float, sin, cos, mix, smoothstep, pow, max, dot, normalize,
 	positionLocal, positionWorld, normalWorld, cameraPosition, mx_noise_float, mx_fractal_noise_float,
-	pass, mrt, output, velocity, renderOutput
+	pass, mrt, output, velocity, renderOutput, texture, screenUV
 } from 'three/tsl';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
@@ -649,6 +649,30 @@ function buildPipeline() {
 buildPipeline();
 
 // ---------------------------------------------------------------------------
+// Bloom auch in VR
+// three.js r187 hat für Post-Processing in WebXR keine offizielle Schnittstelle: RenderPipeline
+// schaltet XR ab. In VR läuft aber ohnehin ein interner Output-Pass (Tone-Mapping-Quad), der das
+// Bild aus einem Zwischenpuffer in die Brille kopiert. Diesen Pass erweitern wir um Bloom.
+// Kantenglättung: in VR rendert der Zwischenpuffer mit MSAA 4x (wie am PC voreingestellt).
+// ---------------------------------------------------------------------------
+
+let xrBloom = null;
+{
+	const nodes = renderer._nodes;
+	const origOutputNode = nodes.getOutputNode.bind( nodes );
+	const origCacheKey = nodes.getOutputCacheKey.bind( nodes );
+	const useXRBloom = () => renderer.xr.isPresenting && settings.bloom && ! query.has( 'nobloom' );
+
+	nodes.getOutputCacheKey = () => origCacheKey() + ( useXRBloom() ? ':xrbloom' : '' );
+	nodes.getOutputNode = function ( outputTarget ) {
+		if ( ! useXRBloom() || outputTarget.isArrayTexture ) return origOutputNode( outputTarget ); // nicht bei Multiview
+		const scene = texture( outputTarget, screenUV );
+		xrBloom = bloom( scene, settings.bloomStrength, 0.4, settings.bloomThreshold );
+		return scene.add( xrBloom ).renderOutput( renderer.toneMapping, renderer.currentColorSpace );
+	};
+}
+
+// ---------------------------------------------------------------------------
 // WebXR (VR) – Backend wurde oben passend zum Gerät gewählt
 // ---------------------------------------------------------------------------
 
@@ -827,8 +851,8 @@ fFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
 fFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
 fFx.add( U.fireflyGlow, 'value', 0, 20, 0.5 ).name( 'Glühwürmchen' );
 fFx.add( settings, 'bloom' ).name( 'Bloom' ).onChange( buildPipeline );
-fFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; } );
-fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onChange( v => { if ( bloomPass ) bloomPass.threshold.value = v; } );
+fFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
+fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onChange( v => { if ( bloomPass ) bloomPass.threshold.value = v; if ( xrBloom ) xrBloom.threshold.value = v; } );
 
 if ( window.innerWidth < 900 ) gui.close();
 
@@ -841,7 +865,7 @@ let fps = 0, frames = 0, lastT = performance.now();
 
 function updateInfo() {
 	const backend = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2';
-	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA` : `AA: ${ settings.aa }`;
+	const xr = renderer.xr.isPresenting ? `VR aktiv (${ backend }) – AA: MSAA 4x${ settings.bloom ? ' + Bloom' : '' }` : `AA: ${ settings.aa }`;
 	info.innerHTML = `<b>${ backend }</b>  ·  ${ fps } FPS\n${ xr }\n` +
 		`Schatten: ${ settings.shadowType }, ${ settings.shadowRes }²\n` +
 		( renderer.xr.isPresenting ? `Linker Stick: laufen · Rechter Stick: drehen` : `WASD: laufen · Maus: umsehen · Rad: zoomen` );
@@ -879,7 +903,7 @@ function animate() {
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings, rig, camera, LOW };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, LOW, xrBloom: () => xrBloom };
 </script>
 </body>
 </html>
