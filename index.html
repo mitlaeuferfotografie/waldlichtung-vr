@@ -624,6 +624,7 @@ const settings = {
 	grassShadows: false,
 	showShadowCam: false
 };
+const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.7, birds: 0.8, crickets: 0.7, steps: 0.6 };
 
 let pipeline, bloomPass;
 
@@ -960,6 +961,14 @@ fFx.add( settings, 'bloom' ).name( 'Bloom' ).onChange( buildPipeline );
 fFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
 fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onChange( v => { if ( bloomPass ) bloomPass.threshold.value = v; if ( xrBloom ) xrBloom.threshold.value = v; } );
 
+const fSo = gui.addFolder( 'Geräusche' );
+fSo.add( sound, 'on' ).name( 'Ton an' );
+fSo.add( sound, 'master', 0, 1, 0.05 ).name( 'Gesamtlautstärke' );
+fSo.add( sound, 'wind', 0, 1.5, 0.05 ).name( 'Wind & Blätter' );
+fSo.add( sound, 'birds', 0, 1.5, 0.05 ).name( 'Vögel' );
+fSo.add( sound, 'crickets', 0, 1.5, 0.05 ).name( 'Grillen (abends)' );
+fSo.add( sound, 'steps', 0, 1.5, 0.05 ).name( 'Schritte' );
+
 if ( window.innerWidth < 900 ) gui.close();
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1028,12 @@ const vMo = vrGui.addFolder( 'Bewegung' );
 vMo.add( vrOpts, 'walkSpeed', 0.5, 6, 0.1 ).name( 'Laufgeschwindigkeit m/s' );
 vMo.add( vrOpts, 'snapDeg', 15, 90, 15 ).name( 'Drehschritt °' );
 
+const vSo = vrGui.addFolder( 'Geräusche' );
+vSo.add( sound, 'on' ).name( 'Ton an' );
+vSo.add( sound, 'master', 0, 1, 0.05 ).name( 'Gesamtlautstärke' );
+vSo.add( sound, 'birds', 0, 1.5, 0.05 ).name( 'Vögel' );
+vSo.add( sound, 'wind', 0, 1.5, 0.05 ).name( 'Wind & Blätter' );
+
 // Häkchen: lil-gui legt sie in ein <label>. HTMLMesh klickt Label UND Häkchen an -> doppelt umgeschaltet.
 // Label durch ein <div> ersetzen, dann kommt genau ein Klick an.
 for ( const c of vrGui.controllersRecursive() ) {
@@ -1036,7 +1051,7 @@ for ( const f of [ vrGui, ...vrGui.foldersRecursive() ] ) f.close = () => f;
 
 const vrMenu = new InteractiveGroup();
 const vrMenuMesh = new HTMLMesh( vrGui.domElement );
-vrMenuMesh.scale.setScalar( 1.3 );
+vrMenuMesh.scale.setScalar( 1.15 );
 vrMenuMesh.material.fog = false;
 vrMenuMesh.material.toneMapped = false;
 vrMenu.add( vrMenuMesh );
@@ -1093,6 +1108,268 @@ function pollMenuButton( session ) {
 }
 
 // ---------------------------------------------------------------------------
+// Geräusche – komplett im Browser erzeugt (Web Audio API), keine Audiodateien, keine Lizenzfragen
+//   Wind + Blätterrauschen: gefiltertes Rauschen, folgt Windstärke/Windtempo
+//   Vögel: synthetische Gesänge, räumlich (PositionalAudio) in Baumkronen rund um die Lichtung
+//   Grillen: bei tief stehender Sonne; Schritte: beim Laufen (PC und VR)
+//   Browser erlauben Ton erst nach einer Nutzeraktion -> Start beim ersten Klick/Tastendruck
+// ---------------------------------------------------------------------------
+
+const listener = new THREE.AudioListener();
+camera.add( listener );
+const actx = listener.context;
+listener.setMasterVolume( 0 );
+
+const rnd = ( a, b ) => a + Math.random() * ( b - a );
+const pick = arr => arr[ Math.floor( Math.random() * arr.length ) ];
+
+// 4 s weißes Rauschen als Schleife – Grundstoff für Wind, Blätter und Schritte
+const noiseBuf = ( () => {
+	const len = actx.sampleRate * 4, buf = actx.createBuffer( 1, len, actx.sampleRate ), d = buf.getChannelData( 0 );
+	for ( let i = 0; i < len; i ++ ) d[ i ] = Math.random() * 2 - 1;
+	return buf;
+} )();
+function noiseSource() {
+	const s = actx.createBufferSource();
+	s.buffer = noiseBuf;
+	s.loop = true;
+	s.start( 0, Math.random() * 3 );
+	return s;
+}
+
+const busWind = actx.createGain(), busCrickets = actx.createGain(), busSteps = actx.createGain();
+for ( const b of [ busWind, busCrickets, busSteps ] ) b.connect( listener.getInput() );
+
+// --- Wind & Blätter: zwei Schichten, links/rechts leicht verschieden für räumliche Breite
+const windLayers = [ - 0.7, 0.7 ].map( ( pan, i ) => {
+	const panner = actx.createStereoPanner();
+	panner.pan.value = pan;
+	panner.connect( busWind );
+
+	const low = actx.createBiquadFilter();
+	low.type = 'lowpass'; low.frequency.value = 400; low.Q.value = 0.6;
+	const lowGain = actx.createGain(); lowGain.gain.value = 0;
+	noiseSource().connect( low ).connect( lowGain ).connect( panner );
+
+	const leaf = actx.createBiquadFilter();
+	leaf.type = 'bandpass'; leaf.frequency.value = 3500; leaf.Q.value = 0.7;
+	const leafGain = actx.createGain(); leafGain.gain.value = 0;
+	noiseSource().connect( leaf ).connect( leafGain ).connect( panner );
+
+	return { low, lowGain, leaf, leafGain, seed: i * 7.3 };
+} );
+
+let windT = 0;
+function updateWind( dt ) {
+	windT += dt * U.windSpeed.value;
+	const strength = U.windStrength.value;
+	const now = actx.currentTime;
+	for ( const L of windLayers ) {
+		const s = L.seed, t = windT;
+		// Böen: weiche Überlagerung langsamer Schwingungen (0..1)
+		const gust = 0.5 + 0.5 * ( 0.55 * Math.sin( t * 0.31 + s ) + 0.3 * Math.sin( t * 0.77 + 2.1 * s ) + 0.15 * Math.sin( t * 1.93 + s ) );
+		const flutter = 0.5 + 0.5 * Math.sin( t * 6.1 + s * 3 ) * Math.sin( t * 2.3 + s );
+		L.lowGain.gain.setTargetAtTime( strength * ( 0.07 + 0.28 * gust ), now, 0.15 );
+		L.low.frequency.setTargetAtTime( 220 + 650 * gust * Math.min( strength, 2 ), now, 0.2 );
+		L.leafGain.gain.setTargetAtTime( strength * ( 0.01 + 0.06 * gust * gust ) * ( 0.7 + 0.3 * flutter ), now, 0.08 );
+		L.leaf.frequency.setTargetAtTime( 2800 + 1800 * gust, now, 0.2 );
+	}
+}
+
+// --- Bausteine für Vogelstimmen und Grillen: ein Ton mit Tonhöhen-Gleiten und Hüllkurve
+function tone( dest, t, dur, f0, f1, vol, type = 'sine', vib = null ) {
+	const o = actx.createOscillator();
+	o.type = type;
+	o.frequency.setValueAtTime( f0, t );
+	o.frequency.exponentialRampToValueAtTime( f1, t + dur );
+	const g = actx.createGain();
+	g.gain.setValueAtTime( 0.0001, t );
+	g.gain.exponentialRampToValueAtTime( vol, t + Math.min( 0.015, dur * 0.3 ) );
+	g.gain.exponentialRampToValueAtTime( 0.0001, t + dur );
+	if ( vib ) {
+		const lfo = actx.createOscillator(), lg = actx.createGain();
+		lfo.frequency.value = vib[ 0 ]; lg.gain.value = vib[ 1 ];
+		lfo.connect( lg ).connect( o.frequency );
+		lfo.start( t ); lfo.stop( t + dur + 0.05 );
+	}
+	o.connect( g ).connect( dest );
+	o.start( t ); o.stop( t + dur + 0.05 );
+}
+
+// Gesänge: geben die Dauer in Sekunden zurück
+const SONGS = {
+	// Meise: „zi-zi-bä“, mehrfach
+	meise( d, t ) {
+		const reps = 2 + Math.floor( rnd( 0, 3 ) ), hi = rnd( 5600, 6400 );
+		for ( let k = 0; k < reps; k ++ ) {
+			const o = t + k * 0.42;
+			tone( d, o, 0.06, hi, hi * 0.9, 0.25 );
+			tone( d, o + 0.11, 0.06, hi, hi * 0.9, 0.25 );
+			tone( d, o + 0.22, 0.15, hi * 0.6, hi * 0.56, 0.3 );
+		}
+		return reps * 0.42;
+	},
+	// Zaunkönig-artiger Triller: viele kurze, schnelle Töne
+	triller( d, t ) {
+		const n = 14 + Math.floor( rnd( 0, 12 ) );
+		let f = rnd( 4200, 5200 ), o = t;
+		for ( let k = 0; k < n; k ++ ) {
+			f = THREE.MathUtils.clamp( f + rnd( - 500, 500 ), 3500, 7000 );
+			tone( d, o, 0.032, f * 1.08, f * 0.92, 0.18, 'triangle' );
+			o += 0.045 + ( k % 5 === 4 ? 0.04 : 0 );
+		}
+		return o - t;
+	},
+	// Amsel-artig: flötende, gleitende Töne, am Ende leises Zwitschern
+	amsel( d, t ) {
+		const scale = [ 1700, 1900, 2150, 2400, 2700, 3000, 3300 ];
+		const n = 4 + Math.floor( rnd( 0, 4 ) );
+		let o = t;
+		for ( let k = 0; k < n; k ++ ) {
+			const f = pick( scale ), dur = rnd( 0.12, 0.32 );
+			tone( d, o, dur, f, f * rnd( 0.85, 1.18 ), 0.35, 'sine', [ rnd( 18, 30 ), f * 0.012 ] );
+			o += dur + rnd( 0.03, 0.09 );
+		}
+		for ( let k = 0; k < 3; k ++ ) { tone( d, o, 0.04, 5200, 4600, 0.08 ); o += 0.06; }
+		return o - t;
+	},
+	// Buchfink-artig: absteigender, schneller werdender Triller mit Schnörkel
+	fink( d, t ) {
+		let o = t, f = rnd( 5400, 6000 ), gap = 0.11;
+		for ( let k = 0; k < 10; k ++ ) {
+			tone( d, o, 0.05, f, f * 0.85, 0.22 );
+			o += gap; gap *= 0.9; f *= 0.95;
+		}
+		tone( d, o + 0.03, 0.12, 3200, 4800, 0.28 );
+		tone( d, o + 0.18, 0.18, 4800, 2600, 0.28 );
+		return o + 0.4 - t;
+	},
+	// Kuckuck: weit entfernt, zwei fallende Töne
+	kuckuck( d, t ) {
+		const reps = 4 + Math.floor( rnd( 0, 5 ) );
+		for ( let k = 0; k < reps; k ++ ) {
+			const o = t + k * 0.95;
+			tone( d, o, 0.22, 780, 750, 0.6, 'sine', [ 6, 4 ] );
+			tone( d, o + 0.3, 0.34, 640, 610, 0.6, 'sine', [ 6, 4 ] );
+		}
+		return reps * 0.95;
+	}
+};
+
+// --- Vögel in Baumkronen am Rand der Lichtung (+ ein Kuckuck weit weg)
+const birds = [];
+{
+	const near = treeSpots.filter( s => { const r = Math.hypot( s.x, s.z ); return r > 15 && r < 40; } ).sort( () => Math.random() - 0.5 );
+	const far = treeSpots.filter( s => Math.hypot( s.x, s.z ) > 60 );
+	const kinds = [ 'meise', 'amsel', 'triller', 'fink', 'meise', 'amsel', 'fink' ];
+	const spots = kinds.map( ( k, i ) => [ k, near[ i ] ] ).filter( e => e[ 1 ] );
+	if ( far.length ) spots.push( [ 'kuckuck', pick( far ) ] );
+	for ( const [ kind, s ] of spots ) {
+		const pa = new THREE.PositionalAudio( listener );
+		const input = actx.createGain();
+		pa.setNodeSource( input );
+		pa.setDistanceModel( 'inverse' );
+		pa.setRefDistance( kind === 'kuckuck' ? 22 : 12 );
+		pa.setRolloffFactor( 0.8 );
+		pa.position.set( s.x, terrainHeight( s.x, s.z ) + rnd( 5, 9 ), s.z );
+		scene.add( pa );
+		birds.push( { kind, pa, input, next: rnd( 1, 8 ) } );
+	}
+}
+
+// --- Grillen: kurze Pulsgruppen um 4,5 kHz, links/rechts verteilt
+const crickets = [ - 0.8, 0.1, 0.9 ].map( pan => {
+	const p = actx.createStereoPanner();
+	p.pan.value = pan;
+	p.connect( busCrickets );
+	return { out: p, f: rnd( 4200, 4900 ), next: rnd( 0, 1 ), period: rnd( 0.42, 0.62 ) };
+} );
+
+// --- Schritte: kurzer gefilterter Rauschimpuls („Gras knistert“)
+function footstep( vol ) {
+	const t = actx.currentTime + 0.01;
+	for ( const [ delay, f, v, len ] of [ [ 0, rnd( 900, 1600 ), vol, 0.16 ], [ 0.045, rnd( 2200, 3400 ), vol * 0.5, 0.1 ] ] ) {
+		const src = actx.createBufferSource();
+		src.buffer = noiseBuf;
+		const bp = actx.createBiquadFilter();
+		bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 0.9;
+		const g = actx.createGain();
+		g.gain.setValueAtTime( 0.0001, t + delay );
+		g.gain.exponentialRampToValueAtTime( v, t + delay + 0.012 );
+		g.gain.exponentialRampToValueAtTime( 0.0001, t + delay + len );
+		src.connect( bp ).connect( g ).connect( busSteps );
+		src.start( t + delay, Math.random() * 3, len + 0.05 );
+	}
+}
+
+let lastStepPhase = 0, wasOnGround = true, vrStepDist = 0;
+const lastRigPos = new THREE.Vector3();
+function updateSteps() {
+	if ( renderer.xr.isPresenting ) {
+		const d = Math.hypot( rig.position.x - lastRigPos.x, rig.position.z - lastRigPos.z );
+		if ( d < 1 ) vrStepDist += d; // große Sprünge (Snap-Turn/Start) nicht zählen
+		lastRigPos.copy( rig.position );
+		if ( vrStepDist > 0.75 ) { vrStepDist = 0; footstep( 0.5 ); }
+		return;
+	}
+	lastRigPos.copy( rig.position );
+	const phase = Math.floor( player.bob / Math.PI );
+	if ( phase !== lastStepPhase && player.onGround ) {
+		const speed = Math.hypot( player.vel.x, player.vel.z );
+		footstep( Math.min( 0.35 + speed * 0.08, 0.9 ) );
+	}
+	lastStepPhase = phase;
+	if ( player.onGround && ! wasOnGround ) footstep( 0.9 ); // Landung nach Sprung
+	wasOnGround = player.onGround;
+}
+
+// --- Steuerung pro Bild: Lautstärken, Tageszeit, Gesänge vorausplanen
+function updateSound( dt ) {
+	if ( actx.state !== 'running' ) return;
+	listener.setMasterVolume( sound.on ? sound.master : 0 );
+	busWind.gain.value = sound.wind;
+	busSteps.gain.value = sound.steps;
+
+	const day = THREE.MathUtils.smoothstep( params.sunElevation, 3, 15 );
+	const night = 1 - THREE.MathUtils.smoothstep( params.sunElevation, 6, 20 );
+	busCrickets.gain.setTargetAtTime( sound.crickets * night * 1.0, actx.currentTime, 0.5 );
+
+	updateWind( dt );
+	updateSteps();
+
+	const now = actx.currentTime;
+	for ( const b of birds ) {
+		b.pa.setVolume( sound.birds );
+		if ( now + 0.3 < b.next ) continue;
+		let pause;
+		if ( day > 0.05 && Math.random() < 0.3 + 0.7 * day ) {
+			const dur = SONGS[ b.kind ]( b.input, Math.max( b.next, now + 0.05 ) );
+			pause = b.kind === 'kuckuck' ? rnd( 20, 45 ) : rnd( 3, 12 ) / ( 0.3 + day );
+			b.next = Math.max( b.next, now ) + dur + pause;
+		} else {
+			b.next = now + rnd( 4, 10 ); // in der Dämmerung schweigen die meisten Vögel
+		}
+	}
+
+	if ( night > 0.02 ) {
+		for ( const c of crickets ) {
+			if ( now + 0.3 < c.next ) continue;
+			const t = Math.max( c.next, now + 0.02 );
+			const pulses = 3 + Math.floor( rnd( 0, 2 ) );
+			for ( let k = 0; k < pulses; k ++ ) tone( c.out, t + k * 0.034, 0.022, c.f, c.f * 0.99, 0.25 );
+			c.next = t + c.period * rnd( 0.9, 1.1 );
+		}
+	}
+}
+
+// Ton freischalten: Browser erlauben Audio erst nach einer Nutzeraktion
+function unlockAudio() {
+	if ( actx.state !== 'running' ) actx.resume();
+}
+for ( const ev of [ 'pointerdown', 'keydown', 'touchstart' ] ) window.addEventListener( ev, unlockAudio, { capture: true } );
+renderer.xr.addEventListener( 'sessionstart', unlockAudio );
+
+// ---------------------------------------------------------------------------
 // Info-Anzeige, Resize, Render-Loop
 // ---------------------------------------------------------------------------
 
@@ -1130,15 +1407,17 @@ function animate() {
 
 	if ( renderer.xr.isPresenting ) {
 		vrLocomotion( dt );
+		updateSound( dt );
 		renderer.render( scene, camera ); // in VR direkt rendern (MSAA des XR-Framebuffers)
 	} else {
 		desktopMove( dt );
+		updateSound( dt );
 		pipeline.render();
 	}
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, sound, actx, birds, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
 </script>
 </body>
 </html>
