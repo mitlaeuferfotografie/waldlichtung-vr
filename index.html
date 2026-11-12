@@ -231,15 +231,12 @@ const params = {
 	fogDensity: 0.005,
 	clouds: 0.35,
 	fireflies: 6,
-	lanterns: 'Automatisch',
-	lanternPower: 1,
 	campfire: true,
 	sunElevation: 0                                                   // wird aus der Uhrzeit berechnet
 };
 let noClouds = false; // in VR auf schwachen Geräten: Wolken-Shader aus
 
 U.night = uniform( 0 );     // 0 = Tag … 1 = tiefe Nacht
-U.lanternOn = uniform( 0 ); // 0 = aus … Helligkeit
 
 // Sonnenhöhe aus der Uhrzeit: Höchststand 50° um 13 Uhr, Aufgang ~7:30, Untergang ~18:30
 const sunElevationAt = t => 57 * Math.cos( ( t - 13 ) / 24 * Math.PI * 2 ) - 7;
@@ -323,9 +320,6 @@ function updateSun() {
 	stars.visible = nightK > 0.01;
 
 	U.fireflyGlow.value = params.fireflies * ( 0.25 + 1.1 * nightK );
-	const autoOn = 1 - S( elev, - 2, 8 ); // Laternen gehen in der Dämmerung an
-	const on = params.lanterns === 'An' ? 1 : params.lanterns === 'Aus' ? 0 : autoOn;
-	U.lanternOn.value = on * params.lanternPower;
 
 	if ( shadowHelper.visible ) shadowHelper.update();
 }
@@ -687,115 +681,6 @@ const fireflies = ( () => {
 } )();
 
 
-// ---------------------------------------------------------------------------
-// Laternen: warmes, flackerndes Licht, leuchtendes Glas (Bloom), Lichthof und Nachtfalter
-// ---------------------------------------------------------------------------
-
-const lanterns = ( () => {
-	const spots = [ [ - 7, 8 ], [ 12, - 4 ] ]; // nur zwei, am Rand der Lichtung
-	const wood = [], metal = [], glass = [];
-	const lights = [];
-	const LAMP_Y = 1.88;
-
-	// Flackern: zwei überlagerte Schwingungen + Zufallsphase je Laterne
-	const flicker = ph => sin( time.mul( 11.0 ).add( ph ) ).mul( sin( time.mul( 6.7 ).add( ph.mul( 2.3 ) ) ) ).mul( 0.12 ).add( sin( time.mul( 23.0 ).add( ph.mul( 5.1 ) ) ).mul( 0.04 ) ).add( 0.88 );
-
-	const tag = ( g, ph ) => {
-		const n = g.attributes.position.count, a = new Float32Array( n );
-		a.fill( ph );
-		g.setAttribute( 'aPhase', new THREE.BufferAttribute( a, 1 ) );
-		return g.index ? g.toNonIndexed() : g;
-	};
-
-	spots.forEach( ( [ x, z ], i ) => {
-		const y = terrainHeight( x, z );
-		const ph = i * 1.7 + 0.3;
-		const place = g => g.translate( x, y, z );
-		// Pfosten + Querholz
-		wood.push( tag( place( new THREE.CylinderGeometry( 0.05, 0.07, 1.72, 8 ).translate( 0, 0.86, 0 ) ), ph ) );
-		// Laternengehäuse: Boden, Eckstreben, Dach, Knauf
-		metal.push( tag( place( new THREE.BoxGeometry( 0.27, 0.04, 0.27 ).translate( 0, 1.72, 0 ) ), ph ) );
-		for ( const [ sx, sz ] of [ [ 1, 1 ], [ 1, - 1 ], [ - 1, 1 ], [ - 1, - 1 ] ] )
-			metal.push( tag( place( new THREE.BoxGeometry( 0.025, 0.31, 0.025 ).translate( sx * 0.11, LAMP_Y, sz * 0.11 ) ), ph ) );
-		metal.push( tag( place( new THREE.ConeGeometry( 0.22, 0.16, 4 ).rotateY( Math.PI / 4 ).translate( 0, 2.11, 0 ) ), ph ) );
-		metal.push( tag( place( new THREE.SphereGeometry( 0.03, 8, 6 ).translate( 0, 2.21, 0 ) ), ph ) );
-		// Glas (leuchtet)
-		glass.push( tag( place( new THREE.BoxGeometry( 0.2, 0.28, 0.2 ).translate( 0, LAMP_Y, 0 ) ), ph ) );
-
-		obstacles.push( { ax: x, az: z, bx: x, bz: z, r: 0.4 } );
-
-		// echte Lichtquellen (auf schwachen Geräten nur jede zweite)
-		{
-			const light = new THREE.PointLight( 0xffa45c, 0, LOW ? 13 : 16, 2 );
-			light.position.set( x, y + LAMP_Y, z );
-			light.userData.phase = ph;
-			scene.add( light );
-			lights.push( light );
-		}
-
-		// Lichthof (Billboard mit weichem Verlauf)
-		const haloMat = new THREE.SpriteNodeMaterial( { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending } );
-		const d = uv().sub( 0.5 ).length().mul( 2 );
-		const fall = pow( float( 1 ).sub( d ).clamp( 0, 1 ), 2.2 );
-		haloMat.colorNode = vec3( 1.0, 0.6, 0.28 ).mul( U.lanternOn.mul( 0.22 ).mul( flicker( float( ph ) ) ) );
-		haloMat.opacityNode = fall;
-		const halo = new THREE.Sprite( haloMat );
-		halo.position.set( x, y + LAMP_Y, z );
-		halo.scale.setScalar( 1.4 );
-		scene.add( halo );
-	} );
-
-	const phase = attribute( 'aPhase', 'float' );
-
-	const woodMat = new THREE.MeshStandardNodeMaterial( { color: 0x3b2a1c, roughness: 0.9 } );
-	const metalMat = new THREE.MeshStandardNodeMaterial( { color: 0x1d1d1f, roughness: 0.45, metalness: 0.7 } );
-	const glassMat = new THREE.MeshBasicNodeMaterial();
-	// tagsüber trübes Glas, nachts warmes HDR-Leuchten (> 1 -> Bloom)
-	glassMat.colorNode = mix( vec3( 0.32, 0.3, 0.26 ), vec3( 1.0, 0.62, 0.3 ).mul( flicker( phase ).mul( 2.6 ) ), U.lanternOn.clamp( 0, 1 ) ).mul( U.lanternOn.max( 1 ) );
-
-	for ( const [ list, mat, shadow ] of [ [ wood, woodMat, true ], [ metal, metalMat, true ], [ glass, glassMat, false ] ] ) {
-		const m = new THREE.Mesh( mergeGeometries( list ), mat );
-		m.castShadow = shadow;
-		m.receiveShadow = true;
-		scene.add( m );
-	}
-
-	// Nachtfalter, die um die Laternen kreisen
-	const parts = [];
-	spots.forEach( ( [ x, z ] ) => {
-		for ( let k = 0; k < 6; k ++ ) {
-			const g = new THREE.TetrahedronGeometry( 0.012, 0 );
-			g.deleteAttribute( 'uv' );
-			const n = g.attributes.position.count, a = new Float32Array( n * 4 );
-			const ph = rand() * 100;
-			for ( let j = 0; j < n; j ++ ) a.set( [ x, terrainHeight( x, z ) + LAMP_Y, z, ph ], j * 4 );
-			g.setAttribute( 'aP', new THREE.BufferAttribute( a, 4 ) );
-			parts.push( g );
-		}
-	} );
-	const mothMat = new THREE.MeshBasicNodeMaterial();
-	const aP = attribute( 'aP', 'vec4' );
-	const t = time.mul( aP.w.fract().add( 1.2 ) ).add( aP.w );
-	const radius = sin( t.mul( 0.7 ) ).mul( 0.15 ).add( 0.38 );
-	mothMat.positionNode = positionLocal.add( aP.xyz ).add( vec3( cos( t.mul( 2.1 ) ).mul( radius ), sin( t.mul( 3.3 ) ).mul( 0.18 ), sin( t.mul( 2.1 ) ).mul( radius ) ) );
-	mothMat.colorNode = vec3( 0.9, 0.7, 0.45 ).mul( U.lanternOn.min( 1 ).mul( 0.9 ) );
-	const moths = new THREE.Mesh( mergeGeometries( parts ), mothMat );
-	moths.frustumCulled = false;
-	scene.add( moths );
-
-	// pro Bild: Lichtstärke mit Flackern (gleiche Formel wie im Shader)
-	function update() {
-		const on = U.lanternOn.value;
-		moths.visible = on > 0.02;
-		const tt = performance.now() / 1000;
-		for ( const l of lights ) {
-			const ph = l.userData.phase;
-			const f = Math.sin( tt * 11 + ph ) * Math.sin( tt * 6.7 + ph * 2.3 ) * 0.12 + Math.sin( tt * 23 + ph * 5.1 ) * 0.04 + 0.88;
-			l.intensity = 3.2 * on * f; // Lichter bleiben sichtbar (Anzahl gleich -> keine Shader-Neuübersetzung)
-		}
-	}
-	return { update, spots };
-} )();
 
 // ---------------------------------------------------------------------------
 // Lagerfeuer am liegenden Baumstamm: Steinring, Holzscheite, Glut, Flammen (Shader-Billboards),
@@ -891,7 +776,7 @@ const campfire = ( () => {
 	sparks.frustumCulled = false;
 	group.add( sparks );
 
-	// Licht: unruhiger als Laternen (mehrere unregelmäßige Schwingungen)
+	// Licht: unruhig flackernd (mehrere unregelmäßige Schwingungen)
 	const light = new THREE.PointLight( 0xff8a3a, 0, 22, 2 );
 	light.position.set( 0, 0.6, 0 );
 	group.add( light );
@@ -1268,8 +1153,6 @@ fFx.add( params, 'fireflies', 0, 20, 0.5 ).name( 'Glühwürmchen' ).onChange( up
 
 const fLa = gui.addFolder( 'Licht in der Nacht' );
 fLa.add( params, 'campfire' ).name( 'Lagerfeuer' );
-fLa.add( params, 'lanterns', [ 'Automatisch', 'An', 'Aus' ] ).name( 'Laternen' ).onChange( updateSun );
-fLa.add( params, 'lanternPower', 0, 3, 0.05 ).name( 'Helligkeit' ).onChange( updateSun );
 fFx.add( settings, 'bloom' ).name( 'Bloom' ).onChange( buildPipeline );
 fFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
 fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onChange( v => { if ( bloomPass ) bloomPass.threshold.value = v; if ( xrBloom ) xrBloom.threshold.value = v; } );
@@ -1341,13 +1224,6 @@ vFx.add( params, 'fireflies', 0, 20, 0.5 ).name( 'Glühwürmchen' ).onChange( up
 
 const vLa = vrGui.addFolder( 'Licht in der Nacht' );
 vLa.add( params, 'campfire' ).name( 'Lagerfeuer' );
-const lanternModes = [ 'Automatisch', 'An', 'Aus' ];
-const lanternBtn = vLa.add( { next: () => {
-	params.lanterns = lanternModes[ ( lanternModes.indexOf( params.lanterns ) + 1 ) % lanternModes.length ];
-	lanternBtn.name( `Laternen: ${ params.lanterns }` );
-	updateSun();
-} }, 'next' ).name( `Laternen: ${ params.lanterns }` );
-vLa.add( params, 'lanternPower', 0, 3, 0.05 ).name( 'Helligkeit' ).onChange( updateSun );
 vFx.add( settings, 'bloom' ).name( 'Bloom' );
 vFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
 
@@ -1908,7 +1784,6 @@ function animate() {
 		vrTimeRefresh += dt;
 		if ( vrMenuOpen && vrTimeRefresh > 1 ) { vrTimeRefresh = 0; vrTimeCtrl.updateDisplay(); }
 	}
-	lanterns.update();
 	campfire.update();
 	if ( now - lastT > 500 ) {
 		fps = Math.round( frames * 1000 / ( now - lastT ) );
@@ -1928,7 +1803,7 @@ function animate() {
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, params, updateSun, lanterns, sound, actx, birds, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, params, updateSun, sound, actx, birds, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
 </script>
 </body>
 </html>
