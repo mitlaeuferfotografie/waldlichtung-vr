@@ -98,6 +98,8 @@ const rand = mulberry32( 1234 );
 const rr = ( a, b ) => a + ( b - a ) * rand();
 
 const CLEARING = 14; // Radius der Lichtung in Metern
+const FIRE_XZ = [ - 1.4, - 0.4 ]; // Lagerfeuer: dort wächst kein Gras
+const nearFire = ( x, z, d ) => ( x - FIRE_XZ[ 0 ] ) ** 2 + ( z - FIRE_XZ[ 1 ] ) ** 2 < d * d;
 
 // Geländehöhe: flache Lichtung, sanfte Hügel im Wald
 function terrainHeight( x, z ) {
@@ -231,6 +233,7 @@ const params = {
 	fireflies: 6,
 	lanterns: 'Automatisch',
 	lanternPower: 1,
+	campfire: true,
 	sunElevation: 0                                                   // wird aus der Uhrzeit berechnet
 };
 let noClouds = false; // in VR auf schwachen Geräten: Wolken-Shader aus
@@ -385,7 +388,7 @@ const grass = ( () => {
 		} while ( r > CLEARING && rand() < ( r - CLEARING ) / ( CLEARING * 0.75 ) );
 
 		const y0 = terrainHeight( x, z );
-		const h = rr( 0.15, 0.42 ) * ( r > CLEARING ? 0.7 : 1 );
+		const h = rr( 0.15, 0.42 ) * ( r > CLEARING ? 0.7 : 1 ) * ( nearFire( x, z, 1.15 ) ? 0 : 1 ); // Feuerstelle frei
 		const w = rr( 0.025, 0.045 );
 		const rot = rand() * Math.PI * 2;
 		const lean = rr( 0.0, 0.25 );
@@ -624,7 +627,7 @@ for ( const [ list, mat ] of [ [ trunks, barkMat ], [ needles, needleMat ], [ le
 	for ( let i = 0; i < 900; i ++ ) {
 		const a = rand() * Math.PI * 2, r = Math.sqrt( rand() ) * CLEARING * 0.95;
 		const x = Math.cos( a ) * r, z = Math.sin( a ) * r;
-		const y = terrainHeight( x, z ) + rr( 0.2, 0.5 );
+		const y = terrainHeight( x, z ) + rr( 0.2, 0.5 ) - ( nearFire( x, z, 1.3 ) ? 5 : 0 ); // an der Feuerstelle im Boden versteckt
 		const g = new THREE.IcosahedronGeometry( rr( 0.03, 0.06 ), 0 );
 		g.scale( 1, 0.5, 1 ).translate( x, y, z );
 		const c = colors[ Math.floor( rand() * colors.length ) ];
@@ -689,7 +692,7 @@ const fireflies = ( () => {
 // ---------------------------------------------------------------------------
 
 const lanterns = ( () => {
-	const spots = [ [ 10, 4 ], [ - 7, 8 ], [ - 11, - 1 ], [ - 1.5, - 1 ], [ 4, - 12 ], [ 12, - 4 ] ];
+	const spots = [ [ - 7, 8 ], [ 12, - 4 ] ]; // nur zwei, am Rand der Lichtung
 	const wood = [], metal = [], glass = [];
 	const lights = [];
 	const LAMP_Y = 1.88;
@@ -722,7 +725,7 @@ const lanterns = ( () => {
 		obstacles.push( { ax: x, az: z, bx: x, bz: z, r: 0.4 } );
 
 		// echte Lichtquellen (auf schwachen Geräten nur jede zweite)
-		if ( ! LOW || i % 2 === 0 ) {
+		{
 			const light = new THREE.PointLight( 0xffa45c, 0, LOW ? 13 : 16, 2 );
 			light.position.set( x, y + LAMP_Y, z );
 			light.userData.phase = ph;
@@ -734,11 +737,11 @@ const lanterns = ( () => {
 		const haloMat = new THREE.SpriteNodeMaterial( { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending } );
 		const d = uv().sub( 0.5 ).length().mul( 2 );
 		const fall = pow( float( 1 ).sub( d ).clamp( 0, 1 ), 2.2 );
-		haloMat.colorNode = vec3( 1.0, 0.6, 0.28 ).mul( U.lanternOn.mul( 0.55 ).mul( flicker( float( ph ) ) ) );
+		haloMat.colorNode = vec3( 1.0, 0.6, 0.28 ).mul( U.lanternOn.mul( 0.22 ).mul( flicker( float( ph ) ) ) );
 		haloMat.opacityNode = fall;
 		const halo = new THREE.Sprite( haloMat );
 		halo.position.set( x, y + LAMP_Y, z );
-		halo.scale.setScalar( 2.4 );
+		halo.scale.setScalar( 1.4 );
 		scene.add( halo );
 	} );
 
@@ -748,7 +751,7 @@ const lanterns = ( () => {
 	const metalMat = new THREE.MeshStandardNodeMaterial( { color: 0x1d1d1f, roughness: 0.45, metalness: 0.7 } );
 	const glassMat = new THREE.MeshBasicNodeMaterial();
 	// tagsüber trübes Glas, nachts warmes HDR-Leuchten (> 1 -> Bloom)
-	glassMat.colorNode = mix( vec3( 0.32, 0.3, 0.26 ), vec3( 1.0, 0.62, 0.3 ).mul( flicker( phase ).mul( 6.0 ) ), U.lanternOn.clamp( 0, 1 ) ).mul( U.lanternOn.max( 1 ) );
+	glassMat.colorNode = mix( vec3( 0.32, 0.3, 0.26 ), vec3( 1.0, 0.62, 0.3 ).mul( flicker( phase ).mul( 2.6 ) ), U.lanternOn.clamp( 0, 1 ) ).mul( U.lanternOn.max( 1 ) );
 
 	for ( const [ list, mat, shadow ] of [ [ wood, woodMat, true ], [ metal, metalMat, true ], [ glass, glassMat, false ] ] ) {
 		const m = new THREE.Mesh( mergeGeometries( list ), mat );
@@ -788,10 +791,125 @@ const lanterns = ( () => {
 		for ( const l of lights ) {
 			const ph = l.userData.phase;
 			const f = Math.sin( tt * 11 + ph ) * Math.sin( tt * 6.7 + ph * 2.3 ) * 0.12 + Math.sin( tt * 23 + ph * 5.1 ) * 0.04 + 0.88;
-			l.intensity = 9 * on * f; // Lichter bleiben sichtbar (Anzahl gleich -> keine Shader-Neuübersetzung)
+			l.intensity = 3.2 * on * f; // Lichter bleiben sichtbar (Anzahl gleich -> keine Shader-Neuübersetzung)
 		}
 	}
 	return { update, spots };
+} )();
+
+// ---------------------------------------------------------------------------
+// Lagerfeuer am liegenden Baumstamm: Steinring, Holzscheite, Glut, Flammen (Shader-Billboards),
+// aufsteigende Funken und warmes, unruhig flackerndes Licht
+// ---------------------------------------------------------------------------
+
+U.fireOn = uniform( 1 );
+const FIRE = new THREE.Vector3( FIRE_XZ[ 0 ], terrainHeight( ...FIRE_XZ ), FIRE_XZ[ 1 ] );
+
+const campfire = ( () => {
+	const group = new THREE.Group();
+	group.position.copy( FIRE );
+	scene.add( group );
+	obstacles.push( { ax: FIRE.x, az: FIRE.z, bx: FIRE.x, bz: FIRE.z, r: 0.85 } );
+
+	// Steinring
+	const stoneParts = [];
+	for ( let i = 0; i < 9; i ++ ) {
+		const a = i / 9 * Math.PI * 2 + rand() * 0.2;
+		const g = lumpy( new THREE.DodecahedronGeometry( 0.13, 0 ), 0.25, i * 3.1 );
+		g.scale( 1.2, 0.75, 1 ).rotateY( a ).translate( Math.cos( a ) * 0.55, 0.06, Math.sin( a ) * 0.55 );
+		stoneParts.push( g.index ? g.toNonIndexed() : g );
+	}
+	const stones = new THREE.Mesh( mergeGeometries( stoneParts ), new THREE.MeshStandardNodeMaterial( { color: 0x6b6862, roughness: 0.95, flatShading: true } ) );
+	stones.castShadow = stones.receiveShadow = true;
+	group.add( stones );
+
+	// Holzscheite, an den Enden verkohlt und glühend
+	const logParts = [];
+	for ( let i = 0; i < 4; i ++ ) {
+		const a = i / 4 * Math.PI * 2 + 0.4;
+		const g = new THREE.CylinderGeometry( 0.045, 0.06, 0.62, 7 );
+		g.rotateZ( Math.PI / 2 - 0.45 ).rotateY( a ).translate( Math.cos( a ) * 0.13, 0.12, Math.sin( a ) * 0.13 );
+		logParts.push( g.toNonIndexed() );
+	}
+	const logMat = new THREE.MeshStandardNodeMaterial( { roughness: 1 } );
+	const lp = positionLocal;
+	const nearCenter = float( 1 ).sub( smoothstep( 0.05, 0.32, lp.xz.length() ) ); // innen glühend
+	const emberNoise = mx_noise_float( lp.mul( 18 ).add( vec3( 0, time.mul( 0.6 ), 0 ) ) ).mul( 0.5 ).add( 0.5 );
+	logMat.colorNode = mix( vec3( 0.18, 0.12, 0.07 ), vec3( 0.03, 0.025, 0.02 ), nearCenter );
+	logMat.emissiveNode = vec3( 1.0, 0.32, 0.06 ).mul( nearCenter.mul( emberNoise ).mul( 2.5 ).mul( U.fireOn ) );
+	const logs = new THREE.Mesh( mergeGeometries( logParts ), logMat );
+	logs.castShadow = true;
+	group.add( logs );
+
+	// Glutbett
+	const bed = new THREE.Mesh( new THREE.CircleGeometry( 0.32, 20 ).rotateX( - Math.PI / 2 ).translate( 0, 0.02, 0 ), new THREE.MeshBasicNodeMaterial() );
+	const bedNoise = mx_noise_float( positionLocal.xz.mul( 14 ).add( time.mul( 0.4 ) ) ).mul( 0.5 ).add( 0.5 );
+	bed.material.colorNode = mix( vec3( 0.05, 0.02, 0.01 ), vec3( 1.0, 0.35, 0.08 ).mul( 2.2 ), bedNoise.mul( bedNoise ).mul( U.fireOn ) );
+	group.add( bed );
+
+	// Flammen: gekreuzte senkrechte Flächen mit Shader (Form + aufsteigendes Rauschen), additiv
+	const flameMat = new THREE.MeshBasicNodeMaterial( { transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending, fog: false } );
+	{
+		const p = uv();
+		const rise = vec2( p.x.mul( 2.5 ), p.y.mul( 1.6 ).sub( time.mul( 1.8 ) ) );
+		const n = mx_fractal_noise_float( vec3( rise, time.mul( 0.5 ) ), 3 ).mul( 0.5 ).add( 0.5 );
+		const width = float( 0.42 ).mul( float( 1 ).sub( p.y ).pow( 0.7 ) );            // nach oben schmaler
+		const dx = p.x.sub( 0.5 ).add( n.sub( 0.5 ).mul( 0.22 ).mul( p.y ) ).abs();
+		const shape = float( 1 ).sub( smoothstep( width.mul( 0.35 ), width, dx ) ).mul( smoothstep( 0.0, 0.08, p.y ) );
+		const body = shape.mul( float( 1 ).sub( smoothstep( 0.25, 1.0, p.y.add( n.mul( 0.45 ) ) ) ) );
+		const col = mix( vec3( 1.0, 0.62, 0.22 ), vec3( 0.9, 0.18, 0.03 ), p.y.pow( 0.8 ) );
+		flameMat.colorNode = col.mul( body ).mul( 1.8 ).mul( U.fireOn );
+	}
+	const flameGeo = new THREE.PlaneGeometry( 0.62, 0.95 ).translate( 0, 0.5, 0 );
+	for ( let i = 0; i < 3; i ++ ) {
+		const f = new THREE.Mesh( flameGeo, flameMat );
+		f.rotation.y = i * Math.PI / 3;
+		f.position.y = 0.06;
+		f.renderOrder = 2;
+		group.add( f );
+	}
+
+	// Funken: steigen auf, treiben seitlich, verglühen
+	const sparkParts = [];
+	for ( let i = 0; i < 40; i ++ ) {
+		const g = new THREE.OctahedronGeometry( 0.008, 0 );
+		g.deleteAttribute( 'uv' );
+		const n = g.attributes.position.count, a = new Float32Array( n * 2 );
+		const ph = rand(), sp = rr( 0.35, 0.8 );
+		for ( let j = 0; j < n; j ++ ) a.set( [ ph, sp ], j * 2 );
+		g.setAttribute( 'aS', new THREE.BufferAttribute( a, 2 ) );
+		sparkParts.push( g );
+	}
+	const sparkMat = new THREE.MeshBasicNodeMaterial( { fog: false } );
+	const aS = attribute( 'aS', 'vec2' );
+	const life = time.mul( aS.y ).add( aS.x ).fract();                 // 0 → 1 je Funke
+	const seed = aS.x.mul( 91.7 ).add( time.mul( aS.y ).add( aS.x ).floor() );
+	const drift = vec3( sin( seed.mul( 12.9 ) ).mul( 0.25 ).add( sin( life.mul( 9 ).add( seed ) ).mul( 0.08 ) ), life.mul( 2.6 ), cos( seed.mul( 7.3 ) ).mul( 0.25 ) ).mul( vec3( life, 1, life ) );
+	sparkMat.positionNode = positionLocal.mul( float( 1 ).sub( life ).add( 0.3 ) ).add( drift ).add( vec3( 0, 0.25, 0 ) );
+	sparkMat.colorNode = vec3( 1.0, 0.55, 0.15 ).mul( float( 1 ).sub( life ).pow( 1.5 ).mul( 4.0 ).mul( U.fireOn ) );
+	const sparks = new THREE.Mesh( mergeGeometries( sparkParts ), sparkMat );
+	sparks.frustumCulled = false;
+	group.add( sparks );
+
+	// Licht: unruhiger als Laternen (mehrere unregelmäßige Schwingungen)
+	const light = new THREE.PointLight( 0xff8a3a, 0, 22, 2 );
+	light.position.set( 0, 0.6, 0 );
+	group.add( light );
+
+	function update() {
+		const on = params.campfire ? 1 : 0;
+		U.fireOn.value = on;
+		flamesVisible( on > 0 );
+		const t = performance.now() / 1000;
+		const f = 0.78 + 0.12 * Math.sin( t * 9.1 ) * Math.sin( t * 4.3 + 1 ) + 0.07 * Math.sin( t * 17.7 + 2 ) + 0.05 * Math.sin( t * 31 );
+		light.intensity = 14 * on * f * ( 0.35 + 0.65 * U.night.value );
+		light.position.x = Math.sin( t * 5.3 ) * 0.04;
+		light.position.z = Math.cos( t * 4.1 ) * 0.04;
+	}
+	function flamesVisible( v ) {
+		for ( const c of group.children ) if ( c.material === flameMat || c === sparks ) c.visible = v;
+	}
+	return { update, position: FIRE };
 } )();
 
 // ---------------------------------------------------------------------------
@@ -812,7 +930,7 @@ const settings = {
 	grassShadows: false,
 	showShadowCam: false
 };
-const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.5, birds: 0.8, crickets: 0.7, steps: 0.6 };
+const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.5, birds: 0.8, crickets: 0.7, steps: 0.6, fire: 0.8, musicOn: ! query.has( 'ohnemusik' ), music: 0.5 };
 
 let pipeline, bloomPass;
 
@@ -1148,7 +1266,8 @@ fFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
 fFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
 fFx.add( params, 'fireflies', 0, 20, 0.5 ).name( 'Glühwürmchen' ).onChange( updateSun );
 
-const fLa = gui.addFolder( 'Laternen' );
+const fLa = gui.addFolder( 'Licht in der Nacht' );
+fLa.add( params, 'campfire' ).name( 'Lagerfeuer' );
 fLa.add( params, 'lanterns', [ 'Automatisch', 'An', 'Aus' ] ).name( 'Laternen' ).onChange( updateSun );
 fLa.add( params, 'lanternPower', 0, 3, 0.05 ).name( 'Helligkeit' ).onChange( updateSun );
 fFx.add( settings, 'bloom' ).name( 'Bloom' ).onChange( buildPipeline );
@@ -1162,6 +1281,9 @@ fSo.add( sound, 'wind', 0, 1.5, 0.05 ).name( 'Wind & Blätter' );
 fSo.add( sound, 'birds', 0, 1.5, 0.05 ).name( 'Vögel' );
 fSo.add( sound, 'crickets', 0, 1.5, 0.05 ).name( 'Grillen (abends)' );
 fSo.add( sound, 'steps', 0, 1.5, 0.05 ).name( 'Schritte' );
+fSo.add( sound, 'fire', 0, 1.5, 0.05 ).name( 'Lagerfeuer-Knistern' );
+fSo.add( sound, 'musicOn' ).name( 'Musik' );
+fSo.add( sound, 'music', 0, 1, 0.05 ).name( 'Musik-Lautstärke' );
 
 if ( window.innerWidth < 900 ) gui.close();
 
@@ -1217,7 +1339,8 @@ vFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
 vFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
 vFx.add( params, 'fireflies', 0, 20, 0.5 ).name( 'Glühwürmchen' ).onChange( updateSun );
 
-const vLa = vrGui.addFolder( 'Laternen' );
+const vLa = vrGui.addFolder( 'Licht in der Nacht' );
+vLa.add( params, 'campfire' ).name( 'Lagerfeuer' );
 const lanternModes = [ 'Automatisch', 'An', 'Aus' ];
 const lanternBtn = vLa.add( { next: () => {
 	params.lanterns = lanternModes[ ( lanternModes.indexOf( params.lanterns ) + 1 ) % lanternModes.length ];
@@ -1237,6 +1360,8 @@ vSo.add( sound, 'on' ).name( 'Ton an' );
 vSo.add( sound, 'master', 0, 1, 0.05 ).name( 'Gesamtlautstärke' );
 vSo.add( sound, 'birds', 0, 1.5, 0.05 ).name( 'Vögel' );
 vSo.add( sound, 'wind', 0, 1.5, 0.05 ).name( 'Wind & Blätter' );
+vSo.add( sound, 'musicOn' ).name( 'Musik' );
+vSo.add( sound, 'music', 0, 1, 0.05 ).name( 'Musik-Lautstärke' );
 
 // Häkchen: lil-gui legt sie in ein <label>. HTMLMesh klickt Label UND Häkchen an -> doppelt umgeschaltet.
 // Label durch ein <div> ersetzen, dann kommt genau ein Klick an.
@@ -1255,7 +1380,7 @@ for ( const f of [ vrGui, ...vrGui.foldersRecursive() ] ) f.close = () => f;
 
 const vrMenu = new InteractiveGroup();
 const vrMenuMesh = new HTMLMesh( vrGui.domElement );
-vrMenuMesh.scale.setScalar( 1.05 );
+vrMenuMesh.scale.setScalar( 1.0 );
 vrMenuMesh.material.fog = false;
 vrMenuMesh.material.toneMapped = false;
 vrMenu.add( vrMenuMesh );
@@ -1549,6 +1674,138 @@ function updateSteps() {
 	wasOnGround = player.onGround;
 }
 
+
+// --- Lagerfeuer-Knistern (räumlich am Feuer): leises Rauschen + zufällige Knackser
+const fireSound = ( () => {
+	const pa = new THREE.PositionalAudio( listener );
+	const input = actx.createGain();
+	pa.setNodeSource( input );
+	pa.setRefDistance( 2.5 );
+	pa.setRolloffFactor( 1.2 );
+	pa.position.copy( campfire.position ).add( new THREE.Vector3( 0, 0.4, 0 ) );
+	scene.add( pa );
+
+	const lp = actx.createBiquadFilter();
+	lp.type = 'lowpass'; lp.frequency.value = 700;
+	const hiss = actx.createGain(); hiss.gain.value = 0.05;
+	noiseSource().connect( lp ).connect( hiss ).connect( input );
+
+	let next = 0;
+	function crackle( t ) {
+		const src = actx.createBufferSource();
+		src.buffer = noiseBuf;
+		const hp = actx.createBiquadFilter();
+		hp.type = 'bandpass'; hp.frequency.value = rnd( 1500, 6000 ); hp.Q.value = 1.2;
+		const g = actx.createGain();
+		const v = Math.random() < 0.15 ? rnd( 0.5, 0.9 ) : rnd( 0.08, 0.3 ); // ab und zu ein lauter Knacks
+		const len = rnd( 0.008, 0.04 );
+		g.gain.setValueAtTime( v, t );
+		g.gain.exponentialRampToValueAtTime( 0.0001, t + len );
+		src.connect( hp ).connect( g ).connect( input );
+		src.start( t, Math.random() * 3, len + 0.02 );
+	}
+	function update() {
+		const on = params.campfire ? 1 : 0;
+		pa.setVolume( sound.fire * on );
+		if ( ! on ) return;
+		const now = actx.currentTime;
+		while ( next < now + 0.25 ) {
+			next = Math.max( next, now ) + Math.pow( Math.random(), 2 ) * 0.35 + 0.01; // unregelmäßig, oft in Gruppen
+			crackle( next );
+		}
+	}
+	return { update };
+} )();
+
+// --- Hintergrundmusik: ruhige, generative Ambient-Musik (keine Datei, keine Lizenzfrage)
+//   weiche Akkordflächen mit langem Ein-/Ausblenden, darüber selten einzelne Glockentöne, viel Hall
+const music = ( () => {
+	const out = actx.createGain();
+	out.gain.value = 0;
+	out.connect( listener.getInput() );
+
+	// Hall: Faltung mit selbst erzeugter, abklingender Impulsantwort (3,5 s)
+	const reverb = actx.createConvolver();
+	{
+		const len = actx.sampleRate * 3.5, ir = actx.createBuffer( 2, len, actx.sampleRate );
+		for ( let c = 0; c < 2; c ++ ) {
+			const d = ir.getChannelData( c );
+			for ( let i = 0; i < len; i ++ ) d[ i ] = ( Math.random() * 2 - 1 ) * Math.pow( 1 - i / len, 2.6 );
+		}
+		reverb.buffer = ir;
+	}
+	const wet = actx.createGain(); wet.gain.value = 0.55;
+	const dry = actx.createGain(); dry.gain.value = 0.5;
+	reverb.connect( wet ).connect( out );
+	dry.connect( out );
+	const send = actx.createGain(); // alles geht trocken + in den Hall
+	send.connect( dry ); send.connect( reverb );
+
+	const padFilter = actx.createBiquadFilter();
+	padFilter.type = 'lowpass'; padFilter.frequency.value = 1100; padFilter.Q.value = 0.3;
+	padFilter.connect( send );
+
+	const midi = m => 440 * Math.pow( 2, ( m - 69 ) / 12 );
+	// Cmaj9 – Am9 – Fmaj9 – G6sus: offen, ohne Spannung
+	const CHORDS = [ [ 48, 55, 59, 62, 64 ], [ 45, 52, 55, 59, 60 ], [ 41, 48, 52, 55, 57 ], [ 43, 50, 55, 57, 62 ] ];
+	const BELL = [ 72, 74, 76, 79, 81, 84, 86, 88 ]; // C-Dur-Pentatonik, hohe Lage
+	const CHORD_LEN = 9;   // Sekunden pro Akkord
+	let chordIdx = 0, nextChord = 0, nextBell = 0, lastBell = - 1;
+
+	function padNote( m, t, dur, vol ) {
+		for ( const det of [ - 7, 6 ] ) {
+			const o = actx.createOscillator();
+			o.type = det < 0 ? 'sine' : 'triangle';
+			o.frequency.value = midi( m );
+			o.detune.value = det;
+			const g = actx.createGain();
+			g.gain.setValueAtTime( 0.0001, t );
+			g.gain.exponentialRampToValueAtTime( vol, t + 3.5 );            // langsam einblenden
+			g.gain.setValueAtTime( vol, t + dur - 1 );
+			g.gain.exponentialRampToValueAtTime( 0.0001, t + dur + 4 );      // lang ausklingen (überlappt)
+			o.connect( g ).connect( padFilter );
+			o.start( t ); o.stop( t + dur + 4.1 );
+		}
+	}
+	function bell( m, t, vol ) {
+		for ( const [ mul, v, dec ] of [ [ 1, vol, 3.2 ], [ 2.0, vol * 0.25, 1.4 ], [ 3.01, vol * 0.08, 0.8 ] ] ) {
+			const o = actx.createOscillator();
+			o.frequency.value = midi( m ) * mul;
+			const g = actx.createGain();
+			g.gain.setValueAtTime( 0.0001, t );
+			g.gain.exponentialRampToValueAtTime( v, t + 0.01 );
+			g.gain.exponentialRampToValueAtTime( 0.0001, t + dec );
+			o.connect( g ).connect( send );
+			o.start( t ); o.stop( t + dec + 0.05 );
+		}
+	}
+
+	function update() {
+		out.gain.setTargetAtTime( sound.musicOn ? sound.music * 0.9 : 0, actx.currentTime, 0.8 );
+		if ( ! sound.musicOn ) { nextChord = 0; return; }
+		const now = actx.currentTime;
+		if ( nextChord < now + 0.5 ) {
+			const t = Math.max( nextChord, now + 0.1 );
+			const chord = CHORDS[ chordIdx % CHORDS.length ];
+			chordIdx ++;
+			chord.forEach( ( m, i ) => padNote( m, t + i * 0.25, CHORD_LEN, i === 0 ? 0.05 : 0.032 ) );
+			nextChord = t + CHORD_LEN;
+		}
+		if ( nextBell < now + 0.5 ) {
+			const t = Math.max( nextBell, now + 0.1 );
+			if ( Math.random() < 0.45 ) {
+				let i;
+				do { i = Math.floor( Math.random() * BELL.length ); } while ( i === lastBell );
+				lastBell = i;
+				bell( BELL[ i ], t, rnd( 0.04, 0.08 ) );
+				if ( Math.random() < 0.3 ) bell( BELL[ Math.max( 0, i - 2 ) ], t + 0.75, 0.04 ); // kleine Antwort
+			}
+			nextBell = t + rnd( 1.6, 3.4 );
+		}
+	}
+	return { update };
+} )();
+
 // --- Steuerung pro Bild: Lautstärken, Tageszeit, Gesänge vorausplanen
 function updateSound( dt ) {
 	if ( actx.state !== 'running' ) return;
@@ -1562,6 +1819,8 @@ function updateSound( dt ) {
 
 	updateWind( dt );
 	updateSteps();
+	fireSound.update();
+	music.update();
 
 	const now = actx.currentTime;
 	for ( const b of birds ) {
@@ -1641,6 +1900,7 @@ function animate() {
 		if ( vrMenuOpen && vrTimeRefresh > 1 ) { vrTimeRefresh = 0; vrTimeCtrl.updateDisplay(); }
 	}
 	lanterns.update();
+	campfire.update();
 	if ( now - lastT > 500 ) {
 		fps = Math.round( frames * 1000 / ( now - lastT ) );
 		frames = 0; lastT = now;
