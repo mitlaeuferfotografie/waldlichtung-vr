@@ -67,7 +67,7 @@
 import * as THREE from 'three/webgpu';
 import {
 	Fn, uniform, attribute, uv, time, vec2, vec3, vec4, float, sin, cos, mix, smoothstep, pow, max, dot, normalize,
-	positionLocal, positionWorld, normalWorld, cameraPosition, mx_noise_float, mx_fractal_noise_float,
+	positionLocal, positionWorld, normalWorld, cameraPosition, mx_noise_float, mx_fractal_noise_float, mx_cell_noise_float,
 	pass, mrt, output, velocity, renderOutput, texture, screenUV
 } from 'three/tsl';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
@@ -198,7 +198,6 @@ sky.turbidity.value = 4;
 sky.rayleigh.value = 1.2;
 sky.mieCoefficient.value = 0.004;
 sky.mieDirectionalG.value = 0.85;
-sky.cloudCoverage.value = 0.35;
 scene.add( sky );
 
 const hemi = new THREE.HemisphereLight( 0xbfd8ff, 0x3a4a22, 0.9 );
@@ -223,31 +222,109 @@ shadowHelper.visible = false;
 scene.add( shadowHelper );
 
 const params = {
-	sunElevation: 32,
-	sunAzimuth: 75,
-	fogDensity: 0.005
+	time: query.has( 'zeit' ) ? Number( query.get( 'zeit' ) ) : 16.5, // Uhrzeit 0–24 (?zeit=22)
+	cycle: query.get( 'zyklus' ) !== '0',                            // Tag/Nacht läuft (?zyklus=0 hält an)
+	dayMinutes: 10,                                                   // echte Minuten pro 24-h-Tag
+	sunAzimuth: 75,                                                   // dreht die Sonnenbahn
+	fogDensity: 0.005,
+	clouds: 0.35,
+	fireflies: 6,
+	lanterns: 'Automatisch',
+	lanternPower: 1,
+	sunElevation: 0                                                   // wird aus der Uhrzeit berechnet
 };
+let noClouds = false; // in VR auf schwachen Geräten: Wolken-Shader aus
 
-const _c1 = new THREE.Color(), _c2 = new THREE.Color();
+U.night = uniform( 0 );     // 0 = Tag … 1 = tiefe Nacht
+U.lanternOn = uniform( 0 ); // 0 = aus … Helligkeit
+
+// Sonnenhöhe aus der Uhrzeit: Höchststand 50° um 13 Uhr, Aufgang ~7:30, Untergang ~18:30
+const sunElevationAt = t => 57 * Math.cos( ( t - 13 ) / 24 * Math.PI * 2 ) - 7;
+const dirFrom = ( elevDeg, azDeg ) => new THREE.Vector3().setFromSphericalCoords( 1, THREE.MathUtils.degToRad( 90 - elevDeg ), THREE.MathUtils.degToRad( azDeg ) );
+
+// --- Sterne: Kugel um die Szene, Sterne per Zellen-Rauschen im Shader, funkeln leicht
+const stars = ( () => {
+	const mat = new THREE.MeshBasicNodeMaterial( { side: THREE.BackSide, transparent: true, depthWrite: false, fog: false, blending: THREE.AdditiveBlending } );
+	const dir = normalize( positionWorld.sub( cameraPosition ) );
+	const cell = dir.mul( 650 );
+	const h = mx_cell_noise_float( cell );
+	const h2 = mx_cell_noise_float( cell.add( 31.7 ) );
+	const star = smoothstep( 0.9988, 1.0, h ).mul( h2.mul( 1.6 ).add( 0.4 ) );
+	const twinkle = sin( time.mul( h2.mul( 3 ).add( 1 ) ).add( h2.mul( 60 ) ) ).mul( 0.3 ).add( 0.7 );
+	const horizon = smoothstep( 0.02, 0.2, dir.y );
+	mat.colorNode = vec3( 0.85, 0.9, 1.0 ).mul( star ).mul( twinkle ).mul( horizon ).mul( U.night ).mul( 2.5 );
+	const mesh = new THREE.Mesh( new THREE.SphereGeometry( 450, 32, 16 ), mat );
+	mesh.frustumCulled = false;
+	mesh.renderOrder = - 1;
+	scene.add( mesh );
+	return mesh;
+} )();
+
+// --- Mond: leuchtende Kugel gegenüber der Sonne (Bloom gibt den Hof)
+const moon = new THREE.Mesh( new THREE.SphereGeometry( 7, 24, 12 ), new THREE.MeshBasicNodeMaterial( { fog: false } ) );
+moon.material.colorNode = vec3( 1.0, 0.96, 0.86 ).mul( U.night.mul( 2.2 ) );
+scene.add( moon );
+
+const _c1 = new THREE.Color(), _c2 = new THREE.Color(), _c3 = new THREE.Color();
+const _sunDir = new THREE.Vector3(), _moonDir = new THREE.Vector3();
 function updateSun() {
-	const phi = THREE.MathUtils.degToRad( 90 - params.sunElevation );
-	const theta = THREE.MathUtils.degToRad( params.sunAzimuth );
-	const dir = new THREE.Vector3().setFromSphericalCoords( 1, phi, theta );
-	sky.sunPosition.value.copy( dir );
-	U.sunDir.value.copy( dir );
-	sun.position.copy( dir ).multiplyScalar( 120 );
+	const elev = params.sunElevation = sunElevationAt( params.time );
+	const az = params.sunAzimuth + ( params.time - 13 ) * 15;
+	_sunDir.copy( dirFrom( elev, az ) );
+	const moonElev = THREE.MathUtils.clamp( - elev * 0.8, 12, 55 );
+	_moonDir.copy( dirFrom( moonElev, az + 180 ) );
+
+	const S = THREE.MathUtils.smoothstep;
+	const nightK = 1 - S( elev, - 9, - 1 );    // 1 = tiefe Nacht
+	const dayK = S( elev, - 4, 6 );            // 1 = Tag
+	U.night.value = nightK;
+
+	sky.sunPosition.value.copy( _sunDir );
+	sky.cloudCoverage.value = noClouds ? 0 : params.clouds;
+
+	// Hauptlicht: tagsüber Sonne, nachts Mond (Wechsel, wenn beide fast dunkel sind)
+	const e = THREE.MathUtils.clamp( elev / 45, 0, 1 );
+	if ( elev > - 3 ) {
+		const lightDir = dirFrom( Math.max( elev, 3 ), az ); // Schatten nicht flacher als 3°
+		sun.position.copy( lightDir ).multiplyScalar( 120 );
+		_c1.setRGB( 1.0, 0.5, 0.25 ); _c2.setRGB( 1.0, 0.97, 0.9 );
+		sun.color.copy( _c1 ).lerp( _c2, Math.sqrt( e ) );
+		sun.intensity = ( 0.6 + 2.8 * Math.sqrt( e ) ) * S( elev, - 3, 3 );
+		U.sunDir.value.copy( lightDir );
+	} else {
+		sun.position.copy( _moonDir ).multiplyScalar( 120 );
+		sun.color.setRGB( 0.6, 0.72, 1.0 );
+		sun.intensity = 0.42 * S( - elev, 3, 7 );
+		U.sunDir.value.copy( _moonDir );
+	}
 	sun.target.position.set( 0, 0, 0 );
+	U.sunColor.value.copy( sun.color ).multiplyScalar( Math.min( 1, sun.intensity / 1.5 ) );
 
-	const e = THREE.MathUtils.clamp( params.sunElevation / 45, 0, 1 );
-	_c1.setRGB( 1.0, 0.55, 0.28 ); _c2.setRGB( 1.0, 0.97, 0.9 );
-	sun.color.copy( _c1 ).lerp( _c2, Math.sqrt( e ) );
-	U.sunColor.value.copy( sun.color );
-	sun.intensity = 0.6 + 2.8 * Math.sqrt( e );
-	hemi.intensity = 0.25 + 0.75 * e;
+	// Himmelslicht: tagsüber hellblau, nachts dunkles Blau
+	_c1.setRGB( 0.75, 0.85, 1.0 ); _c2.setRGB( 0.22, 0.29, 0.13 );
+	_c3.setRGB( 0.22, 0.3, 0.55 );
+	hemi.color.copy( _c3 ).lerp( _c1, dayK );
+	hemi.groundColor.setRGB( 0.04, 0.05, 0.04 ).lerp( _c2, dayK );
+	hemi.intensity = THREE.MathUtils.lerp( 0.32, 0.25 + 0.75 * e, dayK );
 
-	_c1.setRGB( 0.85, 0.55, 0.42 ); _c2.setRGB( 0.62, 0.74, 0.84 );
-	scene.fog.color.copy( _c1 ).lerp( _c2, Math.sqrt( e ) ).multiplyScalar( 0.35 + 0.65 * e );
-	shadowHelper.update();
+	// Nebel: Tag bläulich, Dämmerung warm, Nacht tiefblau
+	_c1.setRGB( 0.85, 0.5, 0.38 ); _c2.setRGB( 0.62, 0.74, 0.84 );
+	_c3.copy( _c1 ).lerp( _c2, Math.sqrt( e ) ).multiplyScalar( 0.35 + 0.65 * e );
+	scene.fog.color.setRGB( 0.012, 0.018, 0.04 ).lerp( _c3, S( elev, - 10, 4 ) );
+
+	// nachts etwas heller belichten (wie das Auge, das sich anpasst)
+	renderer.toneMappingExposure = settings.exposure * ( 1 + 0.9 * nightK );
+
+	moon.position.copy( _moonDir ).multiplyScalar( 420 );
+	moon.visible = nightK > 0.01;
+	stars.visible = nightK > 0.01;
+
+	U.fireflyGlow.value = params.fireflies * ( 0.25 + 1.1 * nightK );
+	const autoOn = 1 - S( elev, - 2, 8 ); // Laternen gehen in der Dämmerung an
+	const on = params.lanterns === 'An' ? 1 : params.lanterns === 'Aus' ? 0 : autoOn;
+	U.lanternOn.value = on * params.lanternPower;
+
+	if ( shadowHelper.visible ) shadowHelper.update();
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +683,117 @@ const fireflies = ( () => {
 	return mesh;
 } )();
 
+
+// ---------------------------------------------------------------------------
+// Laternen: warmes, flackerndes Licht, leuchtendes Glas (Bloom), Lichthof und Nachtfalter
+// ---------------------------------------------------------------------------
+
+const lanterns = ( () => {
+	const spots = [ [ 10, 4 ], [ - 7, 8 ], [ - 11, - 1 ], [ - 1.5, - 1 ], [ 4, - 12 ], [ 12, - 4 ] ];
+	const wood = [], metal = [], glass = [];
+	const lights = [];
+	const LAMP_Y = 1.88;
+
+	// Flackern: zwei überlagerte Schwingungen + Zufallsphase je Laterne
+	const flicker = ph => sin( time.mul( 11.0 ).add( ph ) ).mul( sin( time.mul( 6.7 ).add( ph.mul( 2.3 ) ) ) ).mul( 0.12 ).add( sin( time.mul( 23.0 ).add( ph.mul( 5.1 ) ) ).mul( 0.04 ) ).add( 0.88 );
+
+	const tag = ( g, ph ) => {
+		const n = g.attributes.position.count, a = new Float32Array( n );
+		a.fill( ph );
+		g.setAttribute( 'aPhase', new THREE.BufferAttribute( a, 1 ) );
+		return g.index ? g.toNonIndexed() : g;
+	};
+
+	spots.forEach( ( [ x, z ], i ) => {
+		const y = terrainHeight( x, z );
+		const ph = i * 1.7 + 0.3;
+		const place = g => g.translate( x, y, z );
+		// Pfosten + Querholz
+		wood.push( tag( place( new THREE.CylinderGeometry( 0.05, 0.07, 1.72, 8 ).translate( 0, 0.86, 0 ) ), ph ) );
+		// Laternengehäuse: Boden, Eckstreben, Dach, Knauf
+		metal.push( tag( place( new THREE.BoxGeometry( 0.27, 0.04, 0.27 ).translate( 0, 1.72, 0 ) ), ph ) );
+		for ( const [ sx, sz ] of [ [ 1, 1 ], [ 1, - 1 ], [ - 1, 1 ], [ - 1, - 1 ] ] )
+			metal.push( tag( place( new THREE.BoxGeometry( 0.025, 0.31, 0.025 ).translate( sx * 0.11, LAMP_Y, sz * 0.11 ) ), ph ) );
+		metal.push( tag( place( new THREE.ConeGeometry( 0.22, 0.16, 4 ).rotateY( Math.PI / 4 ).translate( 0, 2.11, 0 ) ), ph ) );
+		metal.push( tag( place( new THREE.SphereGeometry( 0.03, 8, 6 ).translate( 0, 2.21, 0 ) ), ph ) );
+		// Glas (leuchtet)
+		glass.push( tag( place( new THREE.BoxGeometry( 0.2, 0.28, 0.2 ).translate( 0, LAMP_Y, 0 ) ), ph ) );
+
+		obstacles.push( { ax: x, az: z, bx: x, bz: z, r: 0.4 } );
+
+		// echte Lichtquellen (auf schwachen Geräten nur jede zweite)
+		if ( ! LOW || i % 2 === 0 ) {
+			const light = new THREE.PointLight( 0xffa45c, 0, LOW ? 13 : 16, 2 );
+			light.position.set( x, y + LAMP_Y, z );
+			light.userData.phase = ph;
+			scene.add( light );
+			lights.push( light );
+		}
+
+		// Lichthof (Billboard mit weichem Verlauf)
+		const haloMat = new THREE.SpriteNodeMaterial( { transparent: true, depthWrite: false, blending: THREE.AdditiveBlending } );
+		const d = uv().sub( 0.5 ).length().mul( 2 );
+		const fall = pow( float( 1 ).sub( d ).clamp( 0, 1 ), 2.2 );
+		haloMat.colorNode = vec3( 1.0, 0.6, 0.28 ).mul( U.lanternOn.mul( 0.55 ).mul( flicker( float( ph ) ) ) );
+		haloMat.opacityNode = fall;
+		const halo = new THREE.Sprite( haloMat );
+		halo.position.set( x, y + LAMP_Y, z );
+		halo.scale.setScalar( 2.4 );
+		scene.add( halo );
+	} );
+
+	const phase = attribute( 'aPhase', 'float' );
+
+	const woodMat = new THREE.MeshStandardNodeMaterial( { color: 0x3b2a1c, roughness: 0.9 } );
+	const metalMat = new THREE.MeshStandardNodeMaterial( { color: 0x1d1d1f, roughness: 0.45, metalness: 0.7 } );
+	const glassMat = new THREE.MeshBasicNodeMaterial();
+	// tagsüber trübes Glas, nachts warmes HDR-Leuchten (> 1 -> Bloom)
+	glassMat.colorNode = mix( vec3( 0.32, 0.3, 0.26 ), vec3( 1.0, 0.62, 0.3 ).mul( flicker( phase ).mul( 6.0 ) ), U.lanternOn.clamp( 0, 1 ) ).mul( U.lanternOn.max( 1 ) );
+
+	for ( const [ list, mat, shadow ] of [ [ wood, woodMat, true ], [ metal, metalMat, true ], [ glass, glassMat, false ] ] ) {
+		const m = new THREE.Mesh( mergeGeometries( list ), mat );
+		m.castShadow = shadow;
+		m.receiveShadow = true;
+		scene.add( m );
+	}
+
+	// Nachtfalter, die um die Laternen kreisen
+	const parts = [];
+	spots.forEach( ( [ x, z ] ) => {
+		for ( let k = 0; k < 6; k ++ ) {
+			const g = new THREE.TetrahedronGeometry( 0.012, 0 );
+			g.deleteAttribute( 'uv' );
+			const n = g.attributes.position.count, a = new Float32Array( n * 4 );
+			const ph = rand() * 100;
+			for ( let j = 0; j < n; j ++ ) a.set( [ x, terrainHeight( x, z ) + LAMP_Y, z, ph ], j * 4 );
+			g.setAttribute( 'aP', new THREE.BufferAttribute( a, 4 ) );
+			parts.push( g );
+		}
+	} );
+	const mothMat = new THREE.MeshBasicNodeMaterial();
+	const aP = attribute( 'aP', 'vec4' );
+	const t = time.mul( aP.w.fract().add( 1.2 ) ).add( aP.w );
+	const radius = sin( t.mul( 0.7 ) ).mul( 0.15 ).add( 0.38 );
+	mothMat.positionNode = positionLocal.add( aP.xyz ).add( vec3( cos( t.mul( 2.1 ) ).mul( radius ), sin( t.mul( 3.3 ) ).mul( 0.18 ), sin( t.mul( 2.1 ) ).mul( radius ) ) );
+	mothMat.colorNode = vec3( 0.9, 0.7, 0.45 ).mul( U.lanternOn.min( 1 ).mul( 0.9 ) );
+	const moths = new THREE.Mesh( mergeGeometries( parts ), mothMat );
+	moths.frustumCulled = false;
+	scene.add( moths );
+
+	// pro Bild: Lichtstärke mit Flackern (gleiche Formel wie im Shader)
+	function update() {
+		const on = U.lanternOn.value;
+		moths.visible = on > 0.02;
+		const tt = performance.now() / 1000;
+		for ( const l of lights ) {
+			const ph = l.userData.phase;
+			const f = Math.sin( tt * 11 + ph ) * Math.sin( tt * 6.7 + ph * 2.3 ) * 0.12 + Math.sin( tt * 23 + ph * 5.1 ) * 0.04 + 0.88;
+			l.intensity = 9 * on * f; // Lichter bleiben sichtbar (Anzahl gleich -> keine Shader-Neuübersetzung)
+		}
+	}
+	return { update, spots };
+} )();
+
 // ---------------------------------------------------------------------------
 // Post-Processing-Pipeline: Kantenglättung + Bloom
 // ---------------------------------------------------------------------------
@@ -624,7 +812,7 @@ const settings = {
 	grassShadows: false,
 	showShadowCam: false
 };
-const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.7, birds: 0.8, crickets: 0.7, steps: 0.6 };
+const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.5, birds: 0.8, crickets: 0.7, steps: 0.6 };
 
 let pipeline, bloomPass;
 
@@ -688,7 +876,6 @@ let xrBloom = null;
 const vrButton = VRButton.createButton( renderer, renderer.backend.isWebGPUBackend ? { requiredFeatures: [ 'webgpu' ] } : {} );
 document.body.appendChild( vrButton );
 
-let savedClouds = 0;
 let inVR = false;
 function onSessionStart() {
 	inVR = true;
@@ -697,8 +884,8 @@ function onSessionStart() {
 	rig.position.set( player.pos.x, terrainHeight( player.pos.x, player.pos.z ), player.pos.z );
 	rig.rotation.set( 0, player.yaw, 0 );
 	if ( document.pointerLockElement ) document.exitPointerLock();
-	savedClouds = sky.cloudCoverage.value;
-	if ( LOW ) sky.cloudCoverage.value = 0; // Wolken-Shader kostet pro Pixel viel
+	noClouds = LOW; // Wolken-Shader kostet pro Pixel viel
+	updateSun();
 	renderer.xr.setFoveation( 1 ); // Ränder des Blickfelds gröber rendern (Quest)
 	exitVRBtn.show();
 	updateInfo();
@@ -706,7 +893,8 @@ function onSessionStart() {
 function onSessionEnd() {
 	if ( ! inVR ) return; // nur einmal pro Sitzung
 	inVR = false;
-	sky.cloudCoverage.value = savedClouds;
+	noClouds = false;
+	updateSun();
 	// Spielfigur übernimmt die letzte VR-Position
 	const head = lastVRHead;
 	player.pos.set( head.x, 0, head.z );
@@ -942,21 +1130,27 @@ fSh.add( settings, 'grassShadows' ).name( 'Gras wirft Schatten' ).onChange( v =>
 fSh.add( settings, 'showShadowCam' ).name( 'Schatten-Kamera zeigen' ).onChange( v => { shadowHelper.visible = v; } );
 
 const fLi = gui.addFolder( 'Licht & Himmel' );
-fLi.add( params, 'sunElevation', 1, 85, 0.5 ).name( 'Sonnenhöhe °' ).onChange( updateSun );
-fLi.add( params, 'sunAzimuth', 0, 360, 1 ).name( 'Sonnenrichtung °' ).onChange( updateSun );
+fLi.add( params, 'time', 0, 24, 0.05 ).name( 'Uhrzeit' ).listen().onChange( updateSun );
+fLi.add( params, 'cycle' ).name( 'Tag/Nacht läuft' );
+fLi.add( params, 'dayMinutes', 1, 30, 1 ).name( 'Minuten pro Tag' );
+fLi.add( params, 'sunAzimuth', 0, 360, 1 ).name( 'Sonnenbahn drehen °' ).onChange( updateSun );
 fLi.add( params, 'fogDensity', 0, 0.04, 0.001 ).name( 'Nebel' ).onChange( v => { scene.fog.density = v; } );
-fLi.add( sky.cloudCoverage, 'value', 0, 1, 0.01 ).name( 'Wolken' );
+fLi.add( params, 'clouds', 0, 1, 0.01 ).name( 'Wolken' ).onChange( updateSun );
 fLi.add( settings, 'toneMapping', [ 'AgX', 'ACES Filmic', 'Neutral', 'Keins' ] ).name( 'Tone-Mapping' ).onChange( v => {
 	renderer.toneMapping = { 'AgX': THREE.AgXToneMapping, 'ACES Filmic': THREE.ACESFilmicToneMapping, 'Neutral': THREE.NeutralToneMapping, 'Keins': THREE.NoToneMapping }[ v ];
 	buildPipeline();
 } );
-fLi.add( settings, 'exposure', 0.2, 2.5, 0.05 ).name( 'Belichtung' ).onChange( v => { renderer.toneMappingExposure = v; } );
+fLi.add( settings, 'exposure', 0.2, 2.5, 0.05 ).name( 'Belichtung' ).onChange( updateSun );
 
 const fFx = gui.addFolder( 'Shader-Effekte' );
 fFx.add( U.windStrength, 'value', 0, 3, 0.05 ).name( 'Windstärke' );
 fFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
 fFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
-fFx.add( U.fireflyGlow, 'value', 0, 20, 0.5 ).name( 'Glühwürmchen' );
+fFx.add( params, 'fireflies', 0, 20, 0.5 ).name( 'Glühwürmchen' ).onChange( updateSun );
+
+const fLa = gui.addFolder( 'Laternen' );
+fLa.add( params, 'lanterns', [ 'Automatisch', 'An', 'Aus' ] ).name( 'Laternen' ).onChange( updateSun );
+fLa.add( params, 'lanternPower', 0, 3, 0.05 ).name( 'Helligkeit' ).onChange( updateSun );
 fFx.add( settings, 'bloom' ).name( 'Bloom' ).onChange( buildPipeline );
 fFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
 fFx.add( settings, 'bloomThreshold', 0, 2, 0.05 ).name( 'Bloom-Schwelle' ).onChange( v => { if ( bloomPass ) bloomPass.threshold.value = v; if ( xrBloom ) xrBloom.threshold.value = v; } );
@@ -1003,11 +1197,12 @@ vrGui.add( vrActions, 'close' ).name( '✕  Menü schließen' );
 vrGui.add( vrActions, 'exit' ).name( '⏏  VR beenden' );
 
 const vLi = vrGui.addFolder( 'Licht & Himmel' );
-vLi.add( params, 'sunElevation', 1, 85, 0.5 ).name( 'Sonnenhöhe °' ).onChange( updateSun );
-vLi.add( params, 'sunAzimuth', 0, 360, 1 ).name( 'Sonnenrichtung °' ).onChange( updateSun );
+const vrTimeCtrl = vLi.add( params, 'time', 0, 24, 0.05 ).name( 'Uhrzeit' ).onChange( updateSun );
+vLi.add( params, 'cycle' ).name( 'Tag/Nacht läuft' );
+vLi.add( params, 'dayMinutes', 1, 30, 1 ).name( 'Minuten pro Tag' );
 vLi.add( params, 'fogDensity', 0, 0.04, 0.001 ).name( 'Nebel' ).onChange( v => { scene.fog.density = v; } );
-vLi.add( sky.cloudCoverage, 'value', 0, 1, 0.01 ).name( 'Wolken (kostet Leistung)' );
-vLi.add( settings, 'exposure', 0.2, 2.5, 0.05 ).name( 'Belichtung' ).onChange( v => { renderer.toneMappingExposure = v; } );
+vLi.add( params, 'clouds', 0, 1, 0.01 ).name( 'Wolken (kostet Leistung)' ).onChange( updateSun );
+vLi.add( settings, 'exposure', 0.2, 2.5, 0.05 ).name( 'Belichtung' ).onChange( updateSun );
 
 const vSh = vrGui.addFolder( 'Schatten' );
 vSh.add( settings, 'shadows' ).name( 'Schatten an' ).onChange( v => { sun.castShadow = v; } );
@@ -1020,7 +1215,16 @@ const vFx = vrGui.addFolder( 'Shader-Effekte' );
 vFx.add( U.windStrength, 'value', 0, 3, 0.05 ).name( 'Windstärke' );
 vFx.add( U.windSpeed, 'value', 0, 3, 0.05 ).name( 'Windtempo' );
 vFx.add( U.translucency, 'value', 0, 1.5, 0.05 ).name( 'Blatt-Transluzenz' );
-vFx.add( U.fireflyGlow, 'value', 0, 20, 0.5 ).name( 'Glühwürmchen' );
+vFx.add( params, 'fireflies', 0, 20, 0.5 ).name( 'Glühwürmchen' ).onChange( updateSun );
+
+const vLa = vrGui.addFolder( 'Laternen' );
+const lanternModes = [ 'Automatisch', 'An', 'Aus' ];
+const lanternBtn = vLa.add( { next: () => {
+	params.lanterns = lanternModes[ ( lanternModes.indexOf( params.lanterns ) + 1 ) % lanternModes.length ];
+	lanternBtn.name( `Laternen: ${ params.lanterns }` );
+	updateSun();
+} }, 'next' ).name( `Laternen: ${ params.lanterns }` );
+vLa.add( params, 'lanternPower', 0, 3, 0.05 ).name( 'Helligkeit' ).onChange( updateSun );
 vFx.add( settings, 'bloom' ).name( 'Bloom' );
 vFx.add( settings, 'bloomStrength', 0, 2, 0.05 ).name( 'Bloom-Stärke' ).onChange( v => { if ( bloomPass ) bloomPass.strength.value = v; if ( xrBloom ) xrBloom.strength.value = v; } );
 
@@ -1051,7 +1255,7 @@ for ( const f of [ vrGui, ...vrGui.foldersRecursive() ] ) f.close = () => f;
 
 const vrMenu = new InteractiveGroup();
 const vrMenuMesh = new HTMLMesh( vrGui.domElement );
-vrMenuMesh.scale.setScalar( 1.15 );
+vrMenuMesh.scale.setScalar( 1.05 );
 vrMenuMesh.material.fog = false;
 vrMenuMesh.material.toneMapped = false;
 vrMenu.add( vrMenuMesh );
@@ -1141,38 +1345,50 @@ const busWind = actx.createGain(), busCrickets = actx.createGain(), busSteps = a
 for ( const b of [ busWind, busCrickets, busSteps ] ) b.connect( listener.getInput() );
 
 // --- Wind & Blätter: zwei Schichten, links/rechts leicht verschieden für räumliche Breite
-const windLayers = [ - 0.7, 0.7 ].map( ( pan, i ) => {
+//   Kein tiefes Rauschen (klingt nach Brandung), Böen zufällig statt gleichmäßig an- und abschwellend
+const windLayers = [ - 0.6, 0.6 ].map( () => {
 	const panner = actx.createStereoPanner();
-	panner.pan.value = pan;
 	panner.connect( busWind );
 
-	const low = actx.createBiquadFilter();
-	low.type = 'lowpass'; low.frequency.value = 400; low.Q.value = 0.6;
-	const lowGain = actx.createGain(); lowGain.gain.value = 0;
-	noiseSource().connect( low ).connect( lowGain ).connect( panner );
+	const hp = actx.createBiquadFilter();
+	hp.type = 'highpass'; hp.frequency.value = 250; hp.Q.value = 0.5;
+	const body = actx.createBiquadFilter();
+	body.type = 'bandpass'; body.frequency.value = 900; body.Q.value = 0.6;
+	const bodyGain = actx.createGain(); bodyGain.gain.value = 0;
+	noiseSource().connect( hp ).connect( body ).connect( bodyGain ).connect( panner );
 
 	const leaf = actx.createBiquadFilter();
-	leaf.type = 'bandpass'; leaf.frequency.value = 3500; leaf.Q.value = 0.7;
+	leaf.type = 'bandpass'; leaf.frequency.value = 3500; leaf.Q.value = 0.6;
 	const leafGain = actx.createGain(); leafGain.gain.value = 0;
 	noiseSource().connect( leaf ).connect( leafGain ).connect( panner );
 
-	return { low, lowGain, leaf, leafGain, seed: i * 7.3 };
+	return { panner, body, bodyGain, leaf, leafGain, from: 0.3, to: 0.3, tt: 0, dur: 2, flut: 0.5, flutTo: 0.5 };
 } );
+windLayers[ 0 ].panner.pan.value = - 0.6;
+windLayers[ 1 ].panner.pan.value = 0.6;
 
-let windT = 0;
+// weich überblendete Zufallswerte: neue Böe alle 1,5–5 s (unregelmäßig)
+function gustOf( L, dt ) {
+	L.tt += dt * Math.max( U.windSpeed.value, 0.1 );
+	if ( L.tt >= L.dur ) {
+		L.tt = 0; L.from = L.to; L.to = Math.pow( Math.random(), 1.6 ); L.dur = rnd( 1.5, 5 );
+	}
+	const k = L.tt / L.dur, sm = k * k * ( 3 - 2 * k );
+	// schnelles, zufälliges Blätterflattern
+	if ( Math.random() < dt * 6 ) L.flutTo = Math.random();
+	L.flut += ( L.flutTo - L.flut ) * Math.min( 1, dt * 10 );
+	return L.from + ( L.to - L.from ) * sm;
+}
+
 function updateWind( dt ) {
-	windT += dt * U.windSpeed.value;
-	const strength = U.windStrength.value;
+	const strength = U.windStrength.value * ( 1 - 0.4 * U.night.value ); // nachts ruhiger
 	const now = actx.currentTime;
 	for ( const L of windLayers ) {
-		const s = L.seed, t = windT;
-		// Böen: weiche Überlagerung langsamer Schwingungen (0..1)
-		const gust = 0.5 + 0.5 * ( 0.55 * Math.sin( t * 0.31 + s ) + 0.3 * Math.sin( t * 0.77 + 2.1 * s ) + 0.15 * Math.sin( t * 1.93 + s ) );
-		const flutter = 0.5 + 0.5 * Math.sin( t * 6.1 + s * 3 ) * Math.sin( t * 2.3 + s );
-		L.lowGain.gain.setTargetAtTime( strength * ( 0.07 + 0.28 * gust ), now, 0.15 );
-		L.low.frequency.setTargetAtTime( 220 + 650 * gust * Math.min( strength, 2 ), now, 0.2 );
-		L.leafGain.gain.setTargetAtTime( strength * ( 0.01 + 0.06 * gust * gust ) * ( 0.7 + 0.3 * flutter ), now, 0.08 );
-		L.leaf.frequency.setTargetAtTime( 2800 + 1800 * gust, now, 0.2 );
+		const gust = gustOf( L, dt );
+		L.bodyGain.gain.setTargetAtTime( strength * ( 0.012 + 0.07 * gust ), now, 0.25 );
+		L.body.frequency.setTargetAtTime( 600 + 900 * gust * Math.min( strength, 2 ), now, 0.3 );
+		L.leafGain.gain.setTargetAtTime( strength * ( 0.006 + 0.05 * gust ) * ( 0.6 + 0.4 * L.flut ), now, 0.06 );
+		L.leaf.frequency.setTargetAtTime( 2600 + 1800 * gust, now, 0.2 );
 	}
 }
 
@@ -1245,6 +1461,14 @@ const SONGS = {
 		return o + 0.4 - t;
 	},
 	// Kuckuck: weit entfernt, zwei fallende Töne
+	// Waldkauz: „huuu … hu-hu-huuuu“ (nur nachts)
+	kauz( d, t ) {
+		tone( d, t, 0.7, 560, 520, 0.6, 'sine', [ 5, 6 ] );
+		tone( d, t + 1.6, 0.14, 540, 520, 0.4 );
+		tone( d, t + 1.85, 0.14, 540, 520, 0.4 );
+		tone( d, t + 2.1, 1.1, 580, 500, 0.6, 'sine', [ 14, 18 ] );
+		return 3.3;
+	},
 	kuckuck( d, t ) {
 		const reps = 4 + Math.floor( rnd( 0, 5 ) );
 		for ( let k = 0; k < reps; k ++ ) {
@@ -1264,12 +1488,14 @@ const birds = [];
 	const kinds = [ 'meise', 'amsel', 'triller', 'fink', 'meise', 'amsel', 'fink' ];
 	const spots = kinds.map( ( k, i ) => [ k, near[ i ] ] ).filter( e => e[ 1 ] );
 	if ( far.length ) spots.push( [ 'kuckuck', pick( far ) ] );
+	const mid = treeSpots.filter( s => { const r = Math.hypot( s.x, s.z ); return r > 30 && r < 60; } );
+	if ( mid.length ) spots.push( [ 'kauz', pick( mid ) ] );
 	for ( const [ kind, s ] of spots ) {
 		const pa = new THREE.PositionalAudio( listener );
 		const input = actx.createGain();
 		pa.setNodeSource( input );
 		pa.setDistanceModel( 'inverse' );
-		pa.setRefDistance( kind === 'kuckuck' ? 22 : 12 );
+		pa.setRefDistance( kind === 'kuckuck' ? 22 : kind === 'kauz' ? 18 : 12 );
 		pa.setRolloffFactor( 0.8 );
 		pa.position.set( s.x, terrainHeight( s.x, s.z ) + rnd( 5, 9 ), s.z );
 		scene.add( pa );
@@ -1342,6 +1568,13 @@ function updateSound( dt ) {
 		b.pa.setVolume( sound.birds );
 		if ( now + 0.3 < b.next ) continue;
 		let pause;
+		if ( b.kind === 'kauz' ) {
+			if ( U.night.value > 0.5 && Math.random() < 0.7 ) {
+				const dur = SONGS.kauz( b.input, Math.max( b.next, now + 0.05 ) );
+				b.next = Math.max( b.next, now ) + dur + rnd( 12, 30 );
+			} else b.next = now + rnd( 5, 10 );
+			continue;
+		}
 		if ( day > 0.05 && Math.random() < 0.3 + 0.7 * day ) {
 			const dur = SONGS[ b.kind ]( b.input, Math.max( b.next, now + 0.05 ) );
 			pause = b.kind === 'kuckuck' ? rnd( 20, 45 ) : rnd( 3, 12 ) / ( 0.3 + day );
@@ -1393,12 +1626,21 @@ window.addEventListener( 'resize', () => {
 updateSun();
 updateInfo();
 
-let prevT = performance.now();
+let prevT = performance.now(), vrTimeRefresh = 0;
 function animate() {
 	frames ++;
 	const now = performance.now();
 	const dt = Math.min( ( now - prevT ) / 1000, 0.1 );
 	prevT = now;
+
+	if ( params.cycle ) {
+		params.time = ( params.time + dt * 24 / ( params.dayMinutes * 60 ) ) % 24;
+		updateSun();
+		// VR-Menü-Anzeige nur 1× pro Sekunde auffrischen (Neuzeichnen der Menüfläche kostet)
+		vrTimeRefresh += dt;
+		if ( vrMenuOpen && vrTimeRefresh > 1 ) { vrTimeRefresh = 0; vrTimeCtrl.updateDisplay(); }
+	}
+	lanterns.update();
 	if ( now - lastT > 500 ) {
 		fps = Math.round( frames * 1000 / ( now - lastT ) );
 		frames = 0; lastT = now;
@@ -1417,7 +1659,7 @@ function animate() {
 }
 renderer.setAnimationLoop( animate );
 
-window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, sound, actx, birds, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
+window.__demo = { renderer: () => renderer, scene, settings, rig, camera, player, LOW, params, updateSun, lanterns, sound, actx, birds, setVRMenu, vrMenu, vrGui, xrBloom: () => xrBloom };
 </script>
 </body>
 </html>
