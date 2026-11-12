@@ -930,7 +930,7 @@ const settings = {
 	grassShadows: false,
 	showShadowCam: false
 };
-const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.5, birds: 0.8, crickets: 0.7, steps: 0.6, fire: 0.8, musicOn: ! query.has( 'ohnemusik' ), music: 0.5 };
+const sound = { on: ! query.has( 'stumm' ), master: 0.8, wind: 0.5, birds: 0.8, crickets: 0.7, steps: 0.5, fire: 0.8, musicOn: ! query.has( 'ohnemusik' ), music: 0.5 };
 
 let pipeline, bloomPass;
 
@@ -1637,19 +1637,28 @@ const crickets = [ - 0.8, 0.1, 0.9 ].map( pan => {
 } );
 
 // --- Schritte: kurzer gefilterter Rauschimpuls („Gras knistert“)
-function footstep( vol ) {
+// Schritt auf Wiese/Waldboden: weicher, tiefer Auftritt + leises Rascheln (kein helles Knacken)
+//   onGrass: auf der Lichtung mehr Grasrascheln, im Wald dumpfer (Nadeln, Moos)
+function footstep( vol, onGrass = true ) {
 	const t = actx.currentTime + 0.01;
-	for ( const [ delay, f, v, len ] of [ [ 0, rnd( 900, 1600 ), vol, 0.16 ], [ 0.045, rnd( 2200, 3400 ), vol * 0.5, 0.1 ] ] ) {
+	const layers = [
+		// [ Filtertyp, Frequenz, Lautstärke, Einschwingzeit, Dauer ]
+		[ 'lowpass', rnd( 220, 380 ), vol, 0.018, 0.17 ],                                   // dumpfer Auftritt
+		[ 'bandpass', rnd( 900, 1500 ), vol * ( onGrass ? 0.32 : 0.12 ), 0.04, 0.24 ]        // Halme streifen
+	];
+	for ( const [ type, f, v, att, len ] of layers ) {
 		const src = actx.createBufferSource();
 		src.buffer = noiseBuf;
-		const bp = actx.createBiquadFilter();
-		bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 0.9;
+		const flt = actx.createBiquadFilter();
+		flt.type = type; flt.frequency.value = f; flt.Q.value = 0.6;
+		const soft = actx.createBiquadFilter(); // Höhen kappen -> gedämpft
+		soft.type = 'lowpass'; soft.frequency.value = 2200;
 		const g = actx.createGain();
-		g.gain.setValueAtTime( 0.0001, t + delay );
-		g.gain.exponentialRampToValueAtTime( v, t + delay + 0.012 );
-		g.gain.exponentialRampToValueAtTime( 0.0001, t + delay + len );
-		src.connect( bp ).connect( g ).connect( busSteps );
-		src.start( t + delay, Math.random() * 3, len + 0.05 );
+		g.gain.setValueAtTime( 0.0001, t );
+		g.gain.exponentialRampToValueAtTime( v, t + att );
+		g.gain.exponentialRampToValueAtTime( 0.0001, t + att + len );
+		src.connect( flt ).connect( soft ).connect( g ).connect( busSteps );
+		src.start( t, Math.random() * 3, att + len + 0.05 );
 	}
 }
 
@@ -1660,17 +1669,17 @@ function updateSteps() {
 		const d = Math.hypot( rig.position.x - lastRigPos.x, rig.position.z - lastRigPos.z );
 		if ( d < 1 ) vrStepDist += d; // große Sprünge (Snap-Turn/Start) nicht zählen
 		lastRigPos.copy( rig.position );
-		if ( vrStepDist > 0.75 ) { vrStepDist = 0; footstep( 0.5 ); }
+		if ( vrStepDist > 0.75 ) { vrStepDist = 0; footstep( 0.16, Math.hypot( rig.position.x, rig.position.z ) < CLEARING ); }
 		return;
 	}
 	lastRigPos.copy( rig.position );
 	const phase = Math.floor( player.bob / Math.PI );
 	if ( phase !== lastStepPhase && player.onGround ) {
 		const speed = Math.hypot( player.vel.x, player.vel.z );
-		footstep( Math.min( 0.35 + speed * 0.08, 0.9 ) );
+		footstep( Math.min( 0.1 + speed * 0.02, 0.24 ), Math.hypot( player.pos.x, player.pos.z ) < CLEARING );
 	}
 	lastStepPhase = phase;
-	if ( player.onGround && ! wasOnGround ) footstep( 0.9 ); // Landung nach Sprung
+	if ( player.onGround && ! wasOnGround ) footstep( 0.3, Math.hypot( player.pos.x, player.pos.z ) < CLEARING ); // Landung nach Sprung
 	wasOnGround = player.onGround;
 }
 
